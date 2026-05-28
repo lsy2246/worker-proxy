@@ -54,7 +54,7 @@ const HOP_BY_HOP_HEADERS = new Set([
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": ALLOWED_METHODS.join(", "),
-  "Access-Control-Allow-Headers": "Content-Type, Range",
+  "Access-Control-Allow-Headers": "*",
   "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Range, Content-Type, Accept-Ranges",
 };
 
@@ -179,20 +179,31 @@ function parseDownloadUrl(value, config) {
   return { targetUrl };
 }
 
-function buildUpstreamHeaders(request) {
-  const headers = new Headers();
-  const range = request.headers.get("Range");
-  const userAgent = request.headers.get("User-Agent");
+function buildPreflightHeaders(request) {
+  const headers = new Headers(CORS_HEADERS);
+  const requestedHeaders = request.headers.get("Access-Control-Request-Headers");
 
-  if (range) {
-    headers.set("Range", range);
+  if (requestedHeaders) {
+    headers.set("Access-Control-Allow-Headers", requestedHeaders);
   }
 
-  if (userAgent) {
-    headers.set("User-Agent", userAgent);
+  return headers;
+}
+
+function buildUpstreamHeaders(request, targetUrl) {
+  const headers = new Headers(request.headers);
+
+  for (const name of HOP_BY_HOP_HEADERS) {
+    headers.delete(name);
   }
 
-  headers.set("Accept", request.headers.get("Accept") || "*/*");
+  headers.delete("cf-connecting-ip");
+  headers.delete("cf-ipcountry");
+  headers.delete("cf-ray");
+  headers.delete("x-forwarded-for");
+  headers.delete("x-forwarded-proto");
+  headers.set("Host", targetUrl.host);
+
   return headers;
 }
 
@@ -262,7 +273,7 @@ async function handleDownload(request, env, config) {
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
-      headers: CORS_HEADERS,
+      headers: buildPreflightHeaders(request),
     });
   }
 
@@ -290,7 +301,7 @@ async function handleDownload(request, env, config) {
 
   const upstreamResponse = await fetch(targetUrl.href, {
     method: request.method,
-    headers: buildUpstreamHeaders(request),
+    headers: buildUpstreamHeaders(request, targetUrl),
     redirect: "follow",
   });
 

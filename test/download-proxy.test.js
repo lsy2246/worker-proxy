@@ -56,6 +56,43 @@ test("accepts password from the key query parameter and streams the upstream res
   }
 });
 
+test("forwards incoming request headers to the upstream server", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const headers = init.headers;
+
+    assert.equal(url, "https://files.example.com/demo.zip");
+    assert.equal(headers.get("Host"), "files.example.com");
+    assert.equal(headers.get("Referer"), "https://movie.douban.com/");
+    assert.equal(headers.get("Origin"), "https://example.com");
+    assert.equal(headers.get("Accept-Language"), "zh-CN,zh;q=0.9");
+    assert.equal(headers.get("Cookie"), "session=abc");
+    assert.equal(headers.get("Connection"), null);
+
+    return new Response("ok");
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
+        headers: {
+          Referer: "https://movie.douban.com/",
+          Origin: "https://example.com",
+          "Accept-Language": "zh-CN,zh;q=0.9",
+          Cookie: "session=abc",
+          Connection: "keep-alive",
+        },
+      }),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("rejects passwords sent through the authorization bearer header", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {

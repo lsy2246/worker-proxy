@@ -9,6 +9,7 @@
 - 支持 `Range` 请求，下载器可以断点续传，前提是源站也支持
 - 密码通过查询参数传递：`?key=你的密码`
 - 保留常见下载响应头，例如 `Content-Type`、`Content-Length`、`Content-Disposition`、`Content-Range`
+- 转发访客请求头给目标站，适合需要 `Referer`、`User-Agent` 等请求头的资源
 - 支持按地区、IP、HTTPS、缓存和文本替换规则进行配置
 - 支持自定义下载接口路径，并配置其他路径返回 404、伪装 HTML 或跳转
 
@@ -163,6 +164,8 @@ npx wrangler login
 npx wrangler secret put PROXY_PASSWORD
 ```
 
+如果你在 Cloudflare Dashboard 里管理变量或密钥，`wrangler.toml` 里已经设置了 `keep_vars = true`，避免 `wrangler deploy` 覆盖 Dashboard 中已有的环境变量。
+
 部署：
 
 ```bash
@@ -179,6 +182,7 @@ https://你的-worker.你的账号.workers.dev/download?key=你的密码&url=htt
 
 - 不要把 `PROXY_PASSWORD` 写进 `src/index.js`。
 - `key=` 方式方便，但密码可能进入浏览器历史和访问日志，请避免把带密码的链接公开分享。
+- Worker 会尽量把访客请求头转发给目标站，但会过滤 `Connection`、`Transfer-Encoding` 等协议级请求头，并改写 `Host` 为目标站域名。
 - 默认只允许代理 `https` 地址。如果你把 `https` 改成 `false`，才会允许 `http` 地址。
 - Cloudflare Worker 有请求时长、响应大小、流量和滥用策略限制，大文件下载是否稳定取决于源站、网络和你的 Cloudflare 账户限制。
 
