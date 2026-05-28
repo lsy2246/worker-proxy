@@ -92,10 +92,10 @@ function redirectResponse(url) {
 }
 
 function isAuthorized(url, env) {
-  const password = env.PROXY_PASSWORD;
+  const password = (env.PROXY_PASSWORD || "").trim();
 
   if (!password) {
-    return false;
+    return true;
   }
 
   return url.searchParams.get("key") === password;

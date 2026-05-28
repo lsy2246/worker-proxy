@@ -31,6 +31,8 @@ cp .dev.vars.example .dev.vars
 PROXY_PASSWORD=换成你自己的强密码
 ```
 
+如果把 `PROXY_PASSWORD` 留空，下载接口不会要求 `key` 参数。
+
 ## 本地运行
 
 ```bash
@@ -181,6 +183,7 @@ https://你的-worker.你的账号.workers.dev/download?key=你的密码&url=htt
 ## 安全提醒
 
 - 不要把 `PROXY_PASSWORD` 写进 `src/index.js`。
+- 如果 `PROXY_PASSWORD` 为空，任何人都可以不带 `key` 使用下载代理。
 - `key=` 方式方便，但密码可能进入浏览器历史和访问日志，请避免把带密码的链接公开分享。
 - Worker 会尽量把访客请求头转发给目标站，但会过滤 `Connection`、`Transfer-Encoding` 等协议级请求头，并改写 `Host` 为目标站域名。
 - 默认只允许代理 `https` 地址。如果你把 `https` 改成 `false`，才会允许 `http` 地址。

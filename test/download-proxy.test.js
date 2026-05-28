@@ -22,6 +22,29 @@ test("requires the configured password", async () => {
   assert.equal(await response.text(), "Unauthorized");
 });
 
+test("allows requests without key when no password is configured", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://files.example.com/demo.zip");
+    return new Response("ok");
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+      {
+        PROXY_PASSWORD: "",
+      },
+      {},
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("accepts password from the key query parameter and streams the upstream response", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
