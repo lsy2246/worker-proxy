@@ -116,6 +116,98 @@ test("forwards incoming request headers to the upstream server", async () => {
   }
 });
 
+test("applies upstream request headers from the headers query parameter", async () => {
+  const extraHeaders = encodeURIComponent(
+    JSON.stringify({
+      Referer: "https://movie.douban.com/",
+      "User-Agent": "Mozilla/5.0 test",
+      Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+    }),
+  );
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const headers = init.headers;
+
+    assert.equal(url, "https://img3.doubanio.com/view/photo/demo.webp");
+    assert.equal(headers.get("Host"), "img3.doubanio.com");
+    assert.equal(headers.get("Referer"), "https://movie.douban.com/");
+    assert.equal(headers.get("User-Agent"), "Mozilla/5.0 test");
+    assert.equal(headers.get("Accept"), "image/webp,image/apng,image/*,*/*;q=0.8");
+    assert.equal(headers.get("Accept-Language"), "zh-CN");
+
+    return new Response("ok");
+  };
+
+  try {
+    const response = await worker.fetch(
+      request(
+        `/download?key=secret&url=https%3A%2F%2Fimg3.doubanio.com%2Fview%2Fphoto%2Fdemo.webp&headers=${extraHeaders}`,
+        {
+          headers: {
+            Referer: "https://example.com/",
+            "Accept-Language": "zh-CN",
+          },
+        },
+      ),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects invalid upstream headers JSON", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("upstream fetch should not be called");
+  };
+
+  try {
+    const response = await worker.fetch(
+      request(
+        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&headers=%7Bbad-json",
+      ),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 400);
+    assert.equal(await response.text(), "Invalid headers parameter");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects invalid upstream header names", async () => {
+  const invalidHeaders = encodeURIComponent(
+    JSON.stringify({
+      "Bad Header": "value",
+    }),
+  );
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error("upstream fetch should not be called");
+  };
+
+  try {
+    const response = await worker.fetch(
+      request(
+        `/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&headers=${invalidHeaders}`,
+      ),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 400);
+    assert.equal(await response.text(), "Invalid headers parameter");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("rejects passwords sent through the authorization bearer header", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () => {

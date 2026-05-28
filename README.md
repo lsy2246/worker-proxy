@@ -10,6 +10,7 @@
 - 密码通过查询参数传递：`?key=你的密码`
 - 保留常见下载响应头，例如 `Content-Type`、`Content-Length`、`Content-Disposition`、`Content-Range`
 - 转发访客请求头给目标站，适合需要 `Referer`、`User-Agent` 等请求头的资源
+- 可以通过 `headers=` 参数临时指定发给目标站的请求头
 - 支持按地区、IP、HTTPS、缓存和文本替换规则进行配置
 - 支持自定义下载接口路径，并配置其他路径返回 404、伪装 HTML 或跳转
 
@@ -50,6 +51,23 @@ http://localhost:8787/download?key=你的密码&url=https%3A%2F%2Fexample.com%2F
 ```js
 encodeURIComponent("https://example.com/file.zip")
 ```
+
+如果目标站需要指定请求头，可以额外传 `headers` 参数。`headers` 是一个 JSON 对象，也需要 URL 编码：
+
+```js
+const targetUrl = encodeURIComponent("https://img3.doubanio.com/view/photo/demo.webp");
+const headers = encodeURIComponent(
+  JSON.stringify({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
+    Referer: "https://movie.douban.com/",
+    Accept: "image/webp,image/apng,image/*,*/*;q=0.8",
+  }),
+);
+
+const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUrl}&headers=${headers}`;
+```
+
+请求头优先级是：先复制访问 Worker 时自带的请求头，再应用 `headers=` 里的请求头，最后把 `Host` 固定改成目标站域名。`Connection`、`Transfer-Encoding` 等协议级请求头不会转发。
 
 ## 配置说明
 
@@ -185,7 +203,7 @@ https://你的-worker.你的账号.workers.dev/download?key=你的密码&url=htt
 - 不要把 `PROXY_PASSWORD` 写进 `src/index.js`。
 - 如果 `PROXY_PASSWORD` 为空，任何人都可以不带 `key` 使用下载代理。
 - `key=` 方式方便，但密码可能进入浏览器历史和访问日志，请避免把带密码的链接公开分享。
-- Worker 会尽量把访客请求头转发给目标站，但会过滤 `Connection`、`Transfer-Encoding` 等协议级请求头，并改写 `Host` 为目标站域名。
+- Worker 会尽量把访客请求头转发给目标站，也允许通过 `headers=` 指定额外请求头，但会过滤 `Connection`、`Transfer-Encoding` 等协议级请求头，并改写 `Host` 为目标站域名。
 - 默认只允许代理 `https` 地址。如果你把 `https` 改成 `false`，才会允许 `http` 地址。
 - Cloudflare Worker 有请求时长、响应大小、流量和滥用策略限制，大文件下载是否稳定取决于源站、网络和你的 Cloudflare 账户限制。
 

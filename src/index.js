@@ -179,6 +179,45 @@ function parseDownloadUrl(value, config) {
   return { targetUrl };
 }
 
+function parseUpstreamHeaders(value) {
+  if (!value) {
+    return { headers: {} };
+  }
+
+  let parsedHeaders;
+  try {
+    parsedHeaders = JSON.parse(value);
+  } catch {
+    return { error: "Invalid headers parameter" };
+  }
+
+  if (!parsedHeaders || Array.isArray(parsedHeaders) || typeof parsedHeaders !== "object") {
+    return { error: "Invalid headers parameter" };
+  }
+
+  const headers = {};
+
+  for (const [name, headerValue] of Object.entries(parsedHeaders)) {
+    if (headerValue === undefined || headerValue === null) {
+      continue;
+    }
+
+    if (HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
+      continue;
+    }
+
+    try {
+      new Headers({ [name]: String(headerValue) });
+    } catch {
+      return { error: "Invalid headers parameter" };
+    }
+
+    headers[name] = String(headerValue);
+  }
+
+  return { headers };
+}
+
 function buildPreflightHeaders(request) {
   const headers = new Headers(CORS_HEADERS);
   const requestedHeaders = request.headers.get("Access-Control-Request-Headers");
@@ -190,11 +229,22 @@ function buildPreflightHeaders(request) {
   return headers;
 }
 
-function buildUpstreamHeaders(request, targetUrl) {
+function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}) {
   const headers = new Headers(request.headers);
 
   for (const name of HOP_BY_HOP_HEADERS) {
     headers.delete(name);
+  }
+
+  // headers 查询参数用于临时补充源站需要的请求头，例如 Referer、User-Agent、Accept。
+  for (const [name, value] of Object.entries(extraHeaders)) {
+    if (value === undefined || value === null) {
+      continue;
+    }
+
+    if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
+      headers.set(name, String(value));
+    }
   }
 
   headers.delete("cf-connecting-ip");
@@ -299,9 +349,14 @@ async function handleDownload(request, env, config) {
     return textResponse(error, 400);
   }
 
+  const { headers: extraHeaders, error: headersError } = parseUpstreamHeaders(requestUrl.searchParams.get("headers"));
+  if (headersError) {
+    return textResponse(headersError, 400);
+  }
+
   const upstreamResponse = await fetch(targetUrl.href, {
     method: request.method,
-    headers: buildUpstreamHeaders(request, targetUrl),
+    headers: buildUpstreamHeaders(request, targetUrl, extraHeaders),
     redirect: "follow",
   });
 
