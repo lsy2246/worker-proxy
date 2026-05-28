@@ -10,6 +10,7 @@
 - 密码通过查询参数传递：`?key=你的密码`
 - 保留常见下载响应头，例如 `Content-Type`、`Content-Length`、`Content-Disposition`、`Content-Range`
 - 支持按地区、IP、HTTPS、缓存和文本替换规则进行配置
+- 支持自定义下载接口路径，并配置其他路径返回 404、伪装 HTML 或跳转
 
 ## 本地准备
 
@@ -66,6 +67,18 @@ const disable_cache = true;
 
 // 文本内容替换规则。只会处理文本响应，不会改 zip、exe、mp4、jpg 等二进制文件。
 const replace_dict = {};
+
+// 下载接口路径。留空或填写 "/" 时，默认使用 /download。
+const download_path = "/download";
+
+// 其他路径处理方式：可选 "404"、"html"、"redirect"。
+const fallback_mode = "404";
+
+// fallback_mode = "html" 时返回这段 HTML。
+const fallback_html = "";
+
+// fallback_mode = "redirect" 时跳转到这个地址。
+const fallback_redirect_url = "";
 ```
 
 示例：禁止中国大陆访问，并拦截一个指定 IP：
@@ -90,6 +103,51 @@ const replace_dict = {
 ```
 
 `replace_dict` 只适合文本内容，例如 `text/plain`、`text/html`、`application/json`、`application/javascript`、`application/xml`。压缩包、安装包、视频、图片这类二进制内容不会替换，避免文件损坏。
+
+示例：默认下载接口，其他路径返回 404：
+
+```js
+const download_path = "/download";
+const fallback_mode = "404";
+```
+
+示例：隐藏下载接口，其他路径返回伪装 HTML：
+
+```js
+const download_path = "/api/file";
+const fallback_mode = "html";
+const fallback_html = `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>Welcome</title>
+  </head>
+  <body>
+    <h1>Welcome</h1>
+    <p>Service is running.</p>
+  </body>
+</html>`;
+const fallback_redirect_url = "";
+```
+
+这时访问路径是：
+
+```text
+/api/file?key=你的密码&url=https%3A%2F%2Fexample.com%2Ffile.zip
+```
+
+其他路径，例如 `/`、`/download`、`/anything`，都会返回 `fallback_html`。
+
+示例：其他路径全部跳转到其他页面：
+
+```js
+const download_path = "/download";
+const fallback_mode = "redirect";
+const fallback_html = "";
+const fallback_redirect_url = "https://example.com/";
+```
+
+路由优先级是：先匹配 `download_path`，不匹配时才执行 `fallback_mode`。如果 `download_path` 留空或写成 `/`，会自动回退为 `/download`，避免把下载接口和整站 fallback 混在一起。
 
 ## 部署到 Cloudflare
 

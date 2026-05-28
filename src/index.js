@@ -9,10 +9,22 @@ const blocked_ip_address = [];
 const https = true;
 
 // 是否禁用缓存。true 会把响应头 Cache-Control 改成 no-store。
-const disable_cache = true;
+const disable_cache = false;
 
 // 文本内容替换规则。只会处理文本响应，不会改 zip、exe、mp4、jpg 等二进制文件。
 const replace_dict = {};
+
+// 下载接口路径。留空或填写 "/" 时，默认使用 /download。
+const download_path = "/download";
+
+// 其他路径处理方式：可选 "404"、"html"、"redirect"。
+const fallback_mode = "redirect";
+
+// fallback_mode = "html" 时返回这段 HTML。
+const fallback_html = "";
+
+// fallback_mode = "redirect" 时跳转到这个地址。
+const fallback_redirect_url = "https://b.u.cd";
 // ================== 用户配置区结束 ==================
 
 const DEFAULT_CONFIG = {
@@ -21,6 +33,10 @@ const DEFAULT_CONFIG = {
   https,
   disable_cache,
   replace_dict,
+  download_path,
+  fallback_mode,
+  fallback_html,
+  fallback_redirect_url,
 };
 
 const ALLOWED_METHODS = ["GET", "HEAD", "OPTIONS"];
@@ -53,6 +69,28 @@ function textResponse(message, status, extraHeaders = {}) {
   });
 }
 
+function htmlResponse(html) {
+  return new Response(html, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
+function redirectResponse(url) {
+  return new Response(null, {
+    status: 302,
+    headers: {
+      ...CORS_HEADERS,
+      Location: url,
+      "Cache-Control": "no-store",
+    },
+  });
+}
+
 function isAuthorized(url, env) {
   const password = env.PROXY_PASSWORD;
 
@@ -70,7 +108,36 @@ function normalizeConfig(config = {}) {
     blocked_region: config.blocked_region || DEFAULT_CONFIG.blocked_region,
     blocked_ip_address: config.blocked_ip_address || DEFAULT_CONFIG.blocked_ip_address,
     replace_dict: config.replace_dict || DEFAULT_CONFIG.replace_dict,
+    download_path: normalizeDownloadPath(
+      config.download_path === undefined ? DEFAULT_CONFIG.download_path : config.download_path,
+    ),
+    fallback_mode: config.fallback_mode || DEFAULT_CONFIG.fallback_mode,
+    fallback_html: config.fallback_html === undefined ? DEFAULT_CONFIG.fallback_html : config.fallback_html,
+    fallback_redirect_url:
+      config.fallback_redirect_url === undefined
+        ? DEFAULT_CONFIG.fallback_redirect_url
+        : config.fallback_redirect_url,
   };
+}
+
+function normalizeDownloadPath(path) {
+  if (!path || path === "/") {
+    return "/download";
+  }
+
+  return path.startsWith("/") ? path : `/${path}`;
+}
+
+function handleFallback(config) {
+  if (config.fallback_mode === "html" && config.fallback_html) {
+    return htmlResponse(config.fallback_html);
+  }
+
+  if (config.fallback_mode === "redirect" && config.fallback_redirect_url) {
+    return redirectResponse(config.fallback_redirect_url);
+  }
+
+  return textResponse("Not Found", 404);
 }
 
 function isBlockedRequest(request, config) {
@@ -237,8 +304,8 @@ export function createWorker(config = {}) {
     async fetch(request, env = {}) {
       const url = new URL(request.url);
 
-      if (url.pathname !== "/download") {
-        return textResponse("Not Found", 404);
+      if (url.pathname !== normalizedConfig.download_path) {
+        return handleFallback(normalizedConfig);
       }
 
       try {

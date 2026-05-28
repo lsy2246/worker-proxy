@@ -114,6 +114,124 @@ test("supports CORS preflight requests", async () => {
   assert.equal(response.headers.get("Access-Control-Allow-Methods"), "GET, HEAD, OPTIONS");
 });
 
+test("serves configured fallback HTML for non-download paths", async () => {
+  const configuredWorker = createWorker({
+    fallback_mode: "html",
+    fallback_html: "<!doctype html><title>Home</title><main>hello</main>",
+    fallback_redirect_url: "https://example.com/",
+  });
+
+  const response = await configuredWorker.fetch(request("/anything"), env, {});
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("Content-Type"), "text/html; charset=utf-8");
+  assert.equal(await response.text(), "<!doctype html><title>Home</title><main>hello</main>");
+});
+
+test("redirects non-download paths when fallback redirect is configured", async () => {
+  const configuredWorker = createWorker({
+    fallback_mode: "redirect",
+    fallback_html: "",
+    fallback_redirect_url: "https://example.com/",
+  });
+
+  const response = await configuredWorker.fetch(request("/anything"), env, {});
+
+  assert.equal(response.status, 302);
+  assert.equal(response.headers.get("Location"), "https://example.com/");
+});
+
+test("keeps non-download paths as not found by default", async () => {
+  const configuredWorker = createWorker({
+    fallback_mode: "404",
+    fallback_html: "<!doctype html><title>Hidden</title>",
+    fallback_redirect_url: "https://example.com/",
+  });
+
+  const response = await configuredWorker.fetch(request("/anything"), env, {});
+
+  assert.equal(response.status, 404);
+  assert.equal(await response.text(), "Not Found");
+});
+
+test("keeps the download endpoint working when fallback HTML is configured", async () => {
+  const configuredWorker = createWorker({
+    fallback_mode: "html",
+    fallback_html: "<!doctype html><title>Home</title>",
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response("ok");
+
+  try {
+    const response = await configuredWorker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("uses a configured download path before applying fallback behavior", async () => {
+  const configuredWorker = createWorker({
+    download_path: "/api/file",
+    fallback_mode: "html",
+    fallback_html: "<!doctype html><title>Fallback</title>",
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://files.example.com/demo.zip");
+    return new Response("ok");
+  };
+
+  try {
+    const downloadResponse = await configuredWorker.fetch(
+      request("/api/file?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+      env,
+      {},
+    );
+    const oldDownloadPathResponse = await configuredWorker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+      env,
+      {},
+    );
+
+    assert.equal(downloadResponse.status, 200);
+    assert.equal(await downloadResponse.text(), "ok");
+    assert.equal(oldDownloadPathResponse.status, 200);
+    assert.equal(await oldDownloadPathResponse.text(), "<!doctype html><title>Fallback</title>");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("falls back to the default download path when configured download path is empty or root", async () => {
+  for (const configuredPath of ["", "/"]) {
+    const configuredWorker = createWorker({
+      download_path: configuredPath,
+    });
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => new Response("ok");
+
+    try {
+      const response = await configuredWorker.fetch(
+        request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+        env,
+        {},
+      );
+
+      assert.equal(response.status, 200);
+      assert.equal(await response.text(), "ok");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  }
+});
+
 test("blocks configured Cloudflare country codes", async () => {
   const configuredWorker = createWorker({
     blocked_region: ["CN"],
