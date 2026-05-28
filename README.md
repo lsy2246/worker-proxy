@@ -38,7 +38,7 @@ npm run dev
 浏览器或下载器访问：
 
 ```text
-http://localhost:8787/download?url=https%3A%2F%2Fexample.com%2Ffile.zip&key=你的密码
+http://localhost:8787/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Ffile.zip
 ```
 
 其中 `url` 参数必须 URL 编码。浏览器控制台可以这样编码：
@@ -114,7 +114,7 @@ npm run deploy
 部署后使用：
 
 ```text
-https://你的-worker.你的账号.workers.dev/download?url=https%3A%2F%2Fexample.com%2Ffile.zip&key=你的密码
+https://你的-worker.你的账号.workers.dev/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Ffile.zip
 ```
 
 ## 安全提醒

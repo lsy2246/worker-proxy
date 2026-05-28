@@ -1,6 +1,6 @@
-name = "work-proxy"
+name = "worker-proxy"
 main = "src/index.js"
-compatibility_date = "2026-05-29"
+compatibility_date = "2026-05-28"
 
 [observability]
 enabled = true

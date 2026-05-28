@@ -40,7 +40,7 @@ test("accepts password from the key query parameter and streams the upstream res
 
   try {
     const response = await worker.fetch(
-      request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
       env,
       {},
     );
@@ -81,7 +81,7 @@ test("rejects passwords sent through the authorization bearer header", async () 
 });
 
 test("rejects non-http download URLs", async () => {
-  const response = await worker.fetch(request("/download?url=file%3A%2F%2Fetc%2Fpasswd&key=secret"), env, {});
+  const response = await worker.fetch(request("/download?key=secret&url=file%3A%2F%2Fetc%2Fpasswd"), env, {});
 
   assert.equal(response.status, 400);
   assert.equal(await response.text(), "Only http and https URLs are allowed");
@@ -89,7 +89,7 @@ test("rejects non-http download URLs", async () => {
 
 test("rejects unsupported methods", async () => {
   const response = await worker.fetch(
-    request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret", {
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
       method: "POST",
     }),
     env,
@@ -120,7 +120,7 @@ test("blocks configured Cloudflare country codes", async () => {
   });
 
   const response = await configuredWorker.fetch(
-    request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret", {
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
       headers: {
         "cf-ipcountry": "CN",
       },
@@ -139,7 +139,7 @@ test("blocks configured client IP addresses", async () => {
   });
 
   const response = await configuredWorker.fetch(
-    request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret", {
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
       headers: {
         "cf-connecting-ip": "203.0.113.10",
       },
@@ -158,7 +158,7 @@ test("requires https target URLs when https is enabled", async () => {
   });
 
   const response = await configuredWorker.fetch(
-    request("/download?url=http%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret"),
+    request("/download?key=secret&url=http%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
     env,
     {},
   );
@@ -179,7 +179,7 @@ test("allows http target URLs when https is disabled", async () => {
 
   try {
     const response = await configuredWorker.fetch(
-      request("/download?url=http%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret"),
+      request("/download?key=secret&url=http%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
       env,
       {},
     );
@@ -205,7 +205,7 @@ test("disables caching when disable_cache is enabled", async () => {
 
   try {
     const response = await configuredWorker.fetch(
-      request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
       env,
       {},
     );
@@ -232,7 +232,7 @@ test("replaces text response content only when configured", async () => {
 
   try {
     const response = await configuredWorker.fetch(
-      request("/download?url=https%3A%2F%2Ffiles.example.com%2Freadme.txt&key=secret"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Freadme.txt"),
       env,
       {},
     );
@@ -262,7 +262,7 @@ test("does not replace binary response content", async () => {
 
   try {
     const response = await configuredWorker.fetch(
-      request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&key=secret"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
       env,
       {},
     );
