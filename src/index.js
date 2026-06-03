@@ -58,12 +58,28 @@ const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Range, Content-Type, Accept-Ranges",
 };
 
+const VALID_MODES = new Set(["proxy", "media", "inspect"]);
+const VALID_CACHE_STRATEGIES = new Set(["prefer", "bypass", "refresh"]);
+const VALID_DISPOSITIONS = new Set(["inline", "attachment"]);
+const MEDIA_CACHE_PATH = "/__media_cache__";
+
 function textResponse(message, status, extraHeaders = {}) {
   return new Response(message, {
     status,
     headers: {
       ...CORS_HEADERS,
       "Content-Type": "text/plain; charset=utf-8",
+      ...extraHeaders,
+    },
+  });
+}
+
+function jsonResponse(payload, status = 200, extraHeaders = {}) {
+  return new Response(JSON.stringify(payload, null, 2), {
+    status,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json; charset=utf-8",
       ...extraHeaders,
     },
   });
@@ -218,6 +234,31 @@ function parseUpstreamHeaders(value) {
   return { headers };
 }
 
+function parseRequestOptions(url) {
+  const mode = (url.searchParams.get("mode") || "proxy").trim().toLowerCase();
+  const cache = (url.searchParams.get("cache") || "prefer").trim().toLowerCase();
+  const dispositionValue = url.searchParams.get("disposition");
+  const disposition = dispositionValue ? dispositionValue.trim().toLowerCase() : null;
+
+  if (!VALID_MODES.has(mode)) {
+    return { error: "Invalid mode parameter" };
+  }
+
+  if (!VALID_CACHE_STRATEGIES.has(cache)) {
+    return { error: "Invalid cache parameter" };
+  }
+
+  if (disposition && !VALID_DISPOSITIONS.has(disposition)) {
+    return { error: "Invalid disposition parameter" };
+  }
+
+  return {
+    mode,
+    cache,
+    disposition,
+  };
+}
+
 function buildPreflightHeaders(request) {
   const headers = new Headers(CORS_HEADERS);
   const requestedHeaders = request.headers.get("Access-Control-Request-Headers");
@@ -255,6 +296,29 @@ function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}) {
   headers.set("Host", targetUrl.host);
 
   return headers;
+}
+
+function setContentDisposition(headers, disposition) {
+  if (!disposition) {
+    return;
+  }
+
+  const currentValue = headers.get("Content-Disposition");
+
+  if (!currentValue) {
+    headers.set("Content-Disposition", disposition);
+    return;
+  }
+
+  if (/^\s*(inline|attachment)\b/i.test(currentValue)) {
+    headers.set(
+      "Content-Disposition",
+      currentValue.replace(/^\s*(inline|attachment)\b/i, disposition),
+    );
+    return;
+  }
+
+  headers.set("Content-Disposition", `${disposition}; ${currentValue}`);
 }
 
 function buildResponseHeaders(upstreamHeaders, config) {
@@ -319,6 +383,244 @@ async function buildProxyResponse(upstreamResponse, config) {
   });
 }
 
+function buildMediaHeaders(upstreamHeaders, config) {
+  const headers = buildResponseHeaders(upstreamHeaders, config);
+  headers.set("Accept-Ranges", "bytes");
+
+  if (!config.disable_cache) {
+    headers.set("Cache-Control", "public, max-age=86400");
+  }
+
+  return headers;
+}
+
+function parseSingleRangeHeader(rangeHeader, totalLength) {
+  if (!rangeHeader) {
+    return { type: "full" };
+  }
+
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
+
+  if (!match) {
+    return { type: "invalid" };
+  }
+
+  let start = match[1] === "" ? null : Number.parseInt(match[1], 10);
+  let end = match[2] === "" ? null : Number.parseInt(match[2], 10);
+
+  if (start === null && end === null) {
+    return { type: "invalid" };
+  }
+
+  if (start === null) {
+    const suffixLength = end ?? 0;
+    start = Math.max(totalLength - suffixLength, 0);
+    end = totalLength - 1;
+  } else {
+    end = end === null ? totalLength - 1 : Math.min(end, totalLength - 1);
+  }
+
+  if (start < 0 || start >= totalLength || start > end) {
+    return { type: "invalid" };
+  }
+
+  return {
+    type: "partial",
+    start,
+    end,
+  };
+}
+
+function finalizeResponse(response, requestMethod, disposition) {
+  const headers = new Headers(response.headers);
+  setContentDisposition(headers, disposition);
+
+  return new Response(requestMethod === "HEAD" ? null : response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+function buildRangeNotSatisfiableResponse(totalLength, disposition) {
+  const headers = new Headers(CORS_HEADERS);
+  headers.set("Content-Range", `bytes */${totalLength}`);
+  setContentDisposition(headers, disposition);
+
+  return new Response(null, {
+    status: 416,
+    headers,
+  });
+}
+
+function buildBufferedMediaResponse(buffer, upstreamHeaders, request, config, disposition) {
+  const totalLength = buffer.byteLength;
+  const headers = buildMediaHeaders(upstreamHeaders, config);
+  const range = parseSingleRangeHeader(request.headers.get("Range"), totalLength);
+
+  if (range.type === "invalid") {
+    return buildRangeNotSatisfiableResponse(totalLength, disposition);
+  }
+
+  if (range.type === "full") {
+    headers.set("Content-Length", String(totalLength));
+    setContentDisposition(headers, disposition);
+
+    return new Response(request.method === "HEAD" ? null : buffer.slice(0), {
+      status: 200,
+      headers,
+    });
+  }
+
+  const partialBuffer = buffer.slice(range.start, range.end + 1);
+  headers.set("Content-Length", String(partialBuffer.byteLength));
+  headers.set("Content-Range", `bytes ${range.start}-${range.end}/${totalLength}`);
+  setContentDisposition(headers, disposition);
+
+  return new Response(request.method === "HEAD" ? null : partialBuffer, {
+    status: 206,
+    statusText: "Partial Content",
+    headers,
+  });
+}
+
+async function hashText(value) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (item) => item.toString(16).padStart(2, "0")).join("");
+}
+
+async function buildMediaCacheRequest(requestUrl, targetUrl, extraHeaders) {
+  const serializedHeaders = Object.entries(extraHeaders)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, value]) => `${name}:${value}`)
+    .join("\n");
+  const cacheKey = await hashText(`${targetUrl.href}\n${serializedHeaders}`);
+  const cacheUrl = new URL(requestUrl.origin);
+  cacheUrl.pathname = MEDIA_CACHE_PATH;
+  cacheUrl.search = `?key=${cacheKey}`;
+
+  return new Request(cacheUrl.toString(), {
+    method: "GET",
+  });
+}
+
+function buildCacheLookupRequest(cacheRequest, originalRequest) {
+  const headers = new Headers();
+  const rangeHeader = originalRequest.headers.get("Range");
+
+  if (rangeHeader) {
+    headers.set("Range", rangeHeader);
+  }
+
+  return new Request(cacheRequest.url, {
+    method: "GET",
+    headers,
+  });
+}
+
+function getDefaultCache() {
+  return globalThis.caches?.default || null;
+}
+
+async function fetchUpstreamMetadata(request, targetUrl, extraHeaders) {
+  const headers = buildUpstreamHeaders(request, targetUrl, extraHeaders);
+  headers.delete("Range");
+  const headResponse = await fetch(targetUrl.href, {
+    method: "HEAD",
+    headers,
+    redirect: "follow",
+  });
+
+  return headResponse;
+}
+
+async function handleInspect(request, targetUrl, extraHeaders, requestOptions, config) {
+  const requestUrl = new URL(request.url);
+  const cache = getDefaultCache();
+  const cacheRequest = await buildMediaCacheRequest(requestUrl, targetUrl, extraHeaders);
+  const cachedResponse = cache ? await cache.match(cacheRequest) : null;
+  const upstreamResponse = await fetchUpstreamMetadata(request, targetUrl, extraHeaders);
+
+  return jsonResponse({
+    mode: requestOptions.mode,
+    cache: requestOptions.cache,
+    disposition: requestOptions.disposition,
+    targetUrl: targetUrl.href,
+    mediaCache: {
+      key: cacheRequest.url,
+      status: cache ? (cachedResponse ? "hit" : "miss") : "unavailable",
+      enabled: !config.disable_cache,
+    },
+    upstream: {
+      status: upstreamResponse.status,
+      finalUrl: upstreamResponse.url,
+      contentType: upstreamResponse.headers.get("Content-Type"),
+      contentLength: upstreamResponse.headers.get("Content-Length"),
+      contentDisposition: upstreamResponse.headers.get("Content-Disposition"),
+      acceptRanges: upstreamResponse.headers.get("Accept-Ranges"),
+      contentRange: upstreamResponse.headers.get("Content-Range"),
+    },
+  });
+}
+
+async function cacheMediaResponse(cache, cacheRequest, upstreamHeaders, buffer, config) {
+  if (!cache || config.disable_cache) {
+    return;
+  }
+
+  const headers = buildMediaHeaders(upstreamHeaders, config);
+  headers.delete("Content-Range");
+  headers.set("Content-Length", String(buffer.byteLength));
+
+  await cache.put(
+    cacheRequest,
+    new Response(buffer.slice(0), {
+      status: 200,
+      headers,
+    }),
+  );
+}
+
+async function handleMedia(request, targetUrl, extraHeaders, requestOptions, config) {
+  const requestUrl = new URL(request.url);
+  const cache = getDefaultCache();
+  const cacheRequest = await buildMediaCacheRequest(requestUrl, targetUrl, extraHeaders);
+
+  if (!config.disable_cache && requestOptions.cache === "prefer" && cache) {
+    const cachedResponse = await cache.match(buildCacheLookupRequest(cacheRequest, request));
+
+    if (cachedResponse) {
+      return finalizeResponse(cachedResponse, request.method, requestOptions.disposition);
+    }
+  }
+
+  const upstreamHeaders = buildUpstreamHeaders(request, targetUrl, extraHeaders);
+  upstreamHeaders.delete("Range");
+  const upstreamResponse = await fetch(targetUrl.href, {
+    method: "GET",
+    headers: upstreamHeaders,
+    redirect: "follow",
+  });
+
+  if (!upstreamResponse.ok) {
+    return buildProxyResponse(upstreamResponse, config);
+  }
+
+  const buffer = await upstreamResponse.arrayBuffer();
+
+  if (!config.disable_cache && requestOptions.cache !== "bypass" && cache) {
+    await cacheMediaResponse(cache, cacheRequest, upstreamResponse.headers, buffer, config);
+  }
+
+  return buildBufferedMediaResponse(
+    buffer,
+    upstreamResponse.headers,
+    request,
+    config,
+    requestOptions.disposition,
+  );
+}
+
 async function handleDownload(request, env, config) {
   if (request.method === "OPTIONS") {
     return new Response(null, {
@@ -354,13 +656,33 @@ async function handleDownload(request, env, config) {
     return textResponse(headersError, 400);
   }
 
+  const { mode, cache, disposition, error: optionsError } = parseRequestOptions(requestUrl);
+  if (optionsError) {
+    return textResponse(optionsError, 400);
+  }
+
+  const requestOptions = {
+    mode,
+    cache,
+    disposition,
+  };
+
+  if (requestOptions.mode === "inspect") {
+    return handleInspect(request, targetUrl, extraHeaders, requestOptions, config);
+  }
+
+  if (requestOptions.mode === "media") {
+    return handleMedia(request, targetUrl, extraHeaders, requestOptions, config);
+  }
+
   const upstreamResponse = await fetch(targetUrl.href, {
     method: request.method,
     headers: buildUpstreamHeaders(request, targetUrl, extraHeaders),
     redirect: "follow",
   });
 
-  return buildProxyResponse(upstreamResponse, config);
+  const proxyResponse = await buildProxyResponse(upstreamResponse, config);
+  return finalizeResponse(proxyResponse, request.method, requestOptions.disposition);
 }
 
 export function createWorker(config = {}) {

@@ -11,6 +11,105 @@ function request(path, init) {
   return new Request(`https://proxy.example.test${path}`, init);
 }
 
+function createRangeAwareCache() {
+  const store = new Map();
+
+  return {
+    async put(requestOrUrl, response) {
+      const key = typeof requestOrUrl === "string" ? requestOrUrl : requestOrUrl.url;
+      const buffer = await response.clone().arrayBuffer();
+      store.set(key, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: new Headers(response.headers),
+        buffer,
+      });
+    },
+    async match(requestOrUrl) {
+      const request =
+        typeof requestOrUrl === "string" ? new Request(requestOrUrl) : requestOrUrl;
+      const entry = store.get(request.url);
+
+      if (!entry) {
+        return undefined;
+      }
+
+      const rangeHeader = request.headers.get("Range");
+      const totalLength = entry.buffer.byteLength;
+
+      if (!rangeHeader) {
+        return new Response(entry.buffer.slice(0), {
+          status: entry.status,
+          statusText: entry.statusText,
+          headers: new Headers(entry.headers),
+        });
+      }
+
+      const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
+      if (!match) {
+        return new Response(null, {
+          status: 416,
+          headers: {
+            "Content-Range": `bytes */${totalLength}`,
+          },
+        });
+      }
+
+      let start = match[1] === "" ? null : Number.parseInt(match[1], 10);
+      let end = match[2] === "" ? null : Number.parseInt(match[2], 10);
+
+      if (start === null && end === null) {
+        return new Response(null, {
+          status: 416,
+          headers: {
+            "Content-Range": `bytes */${totalLength}`,
+          },
+        });
+      }
+
+      if (start === null) {
+        const suffixLength = end ?? 0;
+        start = Math.max(totalLength - suffixLength, 0);
+        end = totalLength - 1;
+      } else {
+        end = end === null ? totalLength - 1 : Math.min(end, totalLength - 1);
+      }
+
+      if (start < 0 || start >= totalLength || start > end) {
+        return new Response(null, {
+          status: 416,
+          headers: {
+            "Content-Range": `bytes */${totalLength}`,
+          },
+        });
+      }
+
+      const partialBuffer = entry.buffer.slice(start, end + 1);
+      const headers = new Headers(entry.headers);
+      headers.set("Content-Length", String(partialBuffer.byteLength));
+      headers.set("Content-Range", `bytes ${start}-${end}/${totalLength}`);
+
+      return new Response(partialBuffer, {
+        status: 206,
+        statusText: "Partial Content",
+        headers,
+      });
+    },
+  };
+}
+
+function installMockCache() {
+  const originalCaches = globalThis.caches;
+  const cache = createRangeAwareCache();
+  globalThis.caches = {
+    default: cache,
+  };
+
+  return () => {
+    globalThis.caches = originalCaches;
+  };
+}
+
 test("requires the configured password", async () => {
   const response = await worker.fetch(
     request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
@@ -538,6 +637,242 @@ test("does not replace binary response content", async () => {
     );
 
     assert.equal(await response.text(), "zip-body");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects unsupported mode values", async () => {
+  const response = await worker.fetch(
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&mode=weird"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid mode parameter");
+});
+
+test("rejects unsupported cache strategy values", async () => {
+  const response = await worker.fetch(
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache=force"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid cache parameter");
+});
+
+test("rejects unsupported disposition values", async () => {
+  const response = await worker.fetch(
+    request(
+      "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&disposition=preview",
+    ),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid disposition parameter");
+});
+
+test("can inspect upstream metadata and media cache status", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(null, {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": "345",
+        "Content-Disposition": 'attachment; filename="clip.mp4"',
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=inspect"),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Type"), "application/json; charset=utf-8");
+
+    const payload = await response.json();
+    assert.equal(payload.mode, "inspect");
+    assert.equal(payload.cache, "prefer");
+    assert.equal(payload.targetUrl, "https://files.example.com/clip.mp4");
+    assert.equal(payload.mediaCache.status, "miss");
+    assert.equal(payload.upstream.status, 200);
+    assert.equal(payload.upstream.contentType, "video/mp4");
+    assert.equal(payload.upstream.contentLength, "345");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("serves seekable media responses and warms the cache on the first request", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = async (url, init) => {
+    fetchCount += 1;
+    assert.equal(url, "https://files.example.com/clip.mp4");
+    assert.equal(init.method, "GET");
+    assert.equal(init.headers.get("Range"), null);
+
+    return new Response("0123456789", {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": "10",
+        "Content-Disposition": 'attachment; filename="clip.mp4"',
+      },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media", {
+        headers: {
+          Range: "bytes=2-5",
+        },
+      }),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get("Accept-Ranges"), "bytes");
+    assert.equal(response.headers.get("Content-Range"), "bytes 2-5/10");
+    assert.equal(response.headers.get("Content-Length"), "4");
+    assert.equal(await response.text(), "2345");
+    assert.equal(fetchCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("reuses the cached media body for later range requests", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+
+    return new Response("abcdefghij", {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": "10",
+      },
+    });
+  };
+
+  try {
+    await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media", {
+        headers: {
+          Range: "bytes=0-3",
+        },
+      }),
+      env,
+      {},
+    );
+
+    const secondResponse = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media", {
+        headers: {
+          Range: "bytes=4-7",
+        },
+      }),
+      env,
+      {},
+    );
+
+    assert.equal(secondResponse.status, 206);
+    assert.equal(await secondResponse.text(), "efgh");
+    assert.equal(fetchCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("bypasses media cache when cache=bypass is requested", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+
+    return new Response("klmnopqrst", {
+      status: 200,
+      headers: {
+        "Content-Type": "video/mp4",
+        "Content-Length": "10",
+      },
+    });
+  };
+
+  try {
+    await worker.fetch(
+      request(
+        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media&cache=bypass",
+        {
+          headers: {
+            Range: "bytes=0-1",
+          },
+        },
+      ),
+      env,
+      {},
+    );
+    await worker.fetch(
+      request(
+        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media&cache=bypass",
+        {
+          headers: {
+            Range: "bytes=2-3",
+          },
+        },
+      ),
+      env,
+      {},
+    );
+
+    assert.equal(fetchCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("can override content disposition for proxied downloads", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("ok", {
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Disposition": 'attachment; filename="demo.bin"',
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request(
+        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.bin&disposition=inline",
+      ),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Disposition"), 'inline; filename="demo.bin"');
   } finally {
     globalThis.fetch = originalFetch;
   }

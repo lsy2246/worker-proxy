@@ -1,12 +1,17 @@
 # worker-proxy
 
-一个只做下载代理的 Cloudflare Worker。它不绑定固定上游网站，不区分手机/桌面访问，只通过密码保护 `/download` 入口，然后把指定的 `http` 或 `https` 文件地址流式转发回来。
+一个只做下载代理的 Cloudflare Worker。它不绑定固定上游网站，不区分手机/桌面访问，只通过密码保护 `/download` 入口，然后把指定的 `http` 或 `https` 文件地址代理回来。
 
 ## 功能
 
 - `/download?url=...` 下载代理
 - 支持 `GET`、`HEAD` 和浏览器 CORS 预检 `OPTIONS`
 - 支持 `Range` 请求，下载器可以断点续传，前提是源站也支持
+- 支持 `mode=proxy|media|inspect` 三种处理模式
+- 支持 `cache=prefer|bypass|refresh` 缓存策略
+- 支持 `disposition=inline|attachment` 响应头覆盖
+- `mode=media` 会把完整媒体拉到 Cloudflare Cache API，再由 Worker 自己提供可拖拽的 `206 Partial Content`
+- `mode=inspect` 会返回 JSON 元数据，方便排查源站和缓存状态
 - 密码通过查询参数传递：`?key=你的密码`
 - 保留常见下载响应头，例如 `Content-Type`、`Content-Length`、`Content-Disposition`、`Content-Range`
 - 转发访客请求头给目标站，适合需要 `Referer`、`User-Agent` 等请求头的资源
@@ -68,6 +73,70 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 ```
 
 请求头优先级是：先复制访问 Worker 时自带的请求头，再应用 `headers=` 里的请求头，最后把 `Host` 固定改成目标站域名。`Connection`、`Transfer-Encoding` 等协议级请求头不会转发。
+
+## 请求参数
+
+除了 `url`、`key` 和 `headers`，现在还支持下面三个可选参数：
+
+- `mode`
+  - `proxy`：默认值。透传上游响应，适合图片、普通文件、原本就支持 Range 的源站。
+  - `media`：媒体模式。先完整拉取资源，再缓存为可 seek 的下载体，适合视频。
+  - `inspect`：只返回 JSON，不返回文件内容，用来查看源站状态和缓存状态。
+- `cache`
+  - `prefer`：默认值。优先读 Cloudflare Cache，未命中时拉取上游并回填缓存。
+  - `bypass`：跳过缓存，每次都直接从上游完整拉取后再按当前请求生成响应。
+  - `refresh`：忽略旧缓存，强制重新拉取并覆盖缓存。
+- `disposition`
+  - `inline`：尽量让浏览器直接打开。
+  - `attachment`：尽量让浏览器按附件下载。
+
+示例：普通透传
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Ffile.zip
+```
+
+示例：视频拖拽模式
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=media
+```
+
+示例：强制刷新媒体缓存
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=media&cache=refresh
+```
+
+示例：查看当前资源信息
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=inspect
+```
+
+示例：覆盖 `Content-Disposition`
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fdemo.bin&disposition=inline
+```
+
+## 媒体模式说明
+
+`mode=media` 的目标不是“把浏览器的 `Range` 原样转发给上游”，而是“把原本不支持 seek 的上游资源，转换成浏览器可拖拽的 `206 Partial Content` 响应”。
+
+处理流程是：
+
+1. 浏览器首次请求媒体资源时，Worker 会先完整拉取上游文件。
+2. Worker 会把完整响应写入 Cloudflare Cache API。
+3. 当前请求会直接由 Worker 根据完整内容生成 `206` 或 `200` 响应。
+4. 后续请求会优先命中 Cloudflare Cache，并继续支持 `Range` 拖拽。
+
+注意事项：
+
+- `mode=media` 首次请求的等待时间通常会比普通透传更长，因为它需要先拿到完整媒体。
+- Cloudflare Cache API 是边缘缓存，不保证所有数据中心都已经预热。
+- 如果你把 `disable_cache` 设为 `true`，媒体模式仍能工作，但每次都会重新拉取上游文件。
+- 这个模式最适合“源站能整文件下载，但不能标准 Range seek”的视频源。
 
 ## 配置说明
 
@@ -206,6 +275,7 @@ https://你的-worker.你的账号.workers.dev/download?key=你的密码&url=htt
 - Worker 会尽量把访客请求头转发给目标站，也允许通过 `headers=` 指定额外请求头，但会过滤 `Connection`、`Transfer-Encoding` 等协议级请求头，并改写 `Host` 为目标站域名。
 - 默认只允许代理 `https` 地址。如果你把 `https` 改成 `false`，才会允许 `http` 地址。
 - Cloudflare Worker 有请求时长、响应大小、流量和滥用策略限制，大文件下载是否稳定取决于源站、网络和你的 Cloudflare 账户限制。
+- `mode=media` 会在首次请求时完整拉取文件，更适合短视频、中等体积媒体，不适合无限制地代理超大文件。
 
 ## 测试
 
