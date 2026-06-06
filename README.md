@@ -8,7 +8,7 @@
 - 支持 `GET`、`HEAD` 和浏览器 CORS 预检 `OPTIONS`
 - 支持 `Range` 请求，下载器可以断点续传，前提是源站也支持
 - 支持 `mode=proxy|media|inspect` 三种处理模式
-- 支持 `cache=prefer|bypass|refresh` 缓存策略
+- 支持请求驱动的代理缓存控制，例如 `cache=auto|off|prefer|refresh`
 - 支持 `disposition=inline|attachment` 响应头覆盖
 - `mode=media` 会把完整媒体拉到 Cloudflare Cache API，再由 Worker 自己提供可拖拽的 `206 Partial Content`
 - `mode=inspect` 会返回 JSON 元数据，方便排查源站和缓存状态
@@ -76,16 +76,29 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 
 ## 请求参数
 
-除了 `url`、`key` 和 `headers`，现在还支持下面三个可选参数：
+除了 `url`、`key` 和 `headers`，现在还支持下面几个可选参数：
 
 - `mode`
   - `proxy`：默认值。透传上游响应，适合图片、普通文件、原本就支持 Range 的源站。
   - `media`：媒体模式。先完整拉取资源，再缓存为可 seek 的下载体，适合视频。
   - `inspect`：只返回 JSON，不返回文件内容，用来查看源站状态和缓存状态。
 - `cache`
-  - `prefer`：默认值。优先读 Cloudflare Cache，未命中时拉取上游并回填缓存。
-  - `bypass`：跳过缓存，每次都直接从上游完整拉取后再按当前请求生成响应。
+  - `auto`：默认值。偏保守。`mode=proxy` 不主动写 Worker 缓存，`mode=media` 保持现有媒体缓存行为。
+  - `off`：完全跳过 Worker 管理的缓存。
+  - `prefer`：优先读 Worker 缓存，未命中时拉取上游并尝试回填缓存。
   - `refresh`：忽略旧缓存，强制重新拉取并覆盖缓存。
+  - `bypass`：兼容旧参数，等价于 `off`。
+- `cache_ttl`
+  - 传秒数，例如 `300`、`3600`、`2592000`。
+  - 只在 Worker 管理的缓存启用时生效。
+  - 不传时会自动从上游响应头推导 TTL。
+- `cache_key_mode`
+  - `auto`：默认值。当前实现等价于完整 URL。
+  - `full`：按完整 URL 生成缓存键。
+  - `ignore_search`：忽略查询参数，只按域名和路径生成缓存键。
+  - `custom`：配合 `cache_key` 手动指定缓存资源身份。
+- `cache_key`
+  - 只有 `cache_key_mode=custom` 时需要。
 - `disposition`
   - `inline`：尽量让浏览器直接打开。
   - `attachment`：尽量让浏览器按附件下载。
@@ -102,6 +115,18 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 /download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=media
 ```
 
+示例：给图片启用 30 天代理缓存
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fposter.jpg&cache=prefer&cache_ttl=2592000
+```
+
+示例：给清单接口启用 5 分钟代理缓存
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Ffeed.json&cache=prefer&cache_ttl=300
+```
+
 示例：强制刷新媒体缓存
 
 ```text
@@ -112,6 +137,12 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 
 ```text
 /download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=inspect
+```
+
+示例：两个不同 URL 共用同一份缓存键
+
+```text
+/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fa.jpg&cache=prefer&cache_ttl=300&cache_key_mode=custom&cache_key=album-cover
 ```
 
 示例：覆盖 `Content-Disposition`
@@ -137,6 +168,17 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 - Cloudflare Cache API 是边缘缓存，不保证所有数据中心都已经预热。
 - 如果你把 `disable_cache` 设为 `true`，媒体模式仍能工作，但每次都会重新拉取上游文件。
 - 这个模式最适合“源站能整文件下载，但不能标准 Range seek”的视频源。
+
+## 代理缓存说明
+
+Worker 现在支持“请求驱动的代理缓存”：
+
+- 不传缓存参数时，默认走 `cache=auto`，行为偏保守。
+- 想缓存时，在请求里显式传 `cache=prefer` 或 `cache=refresh`。
+- `cache_ttl` 传秒数时，用调用方指定的 TTL。
+- 不传 `cache_ttl` 时，会尝试从上游 `Cache-Control` 或 `Expires` 推导。
+- 如果 TTL 推导失败，普通 `mode=proxy` 会直接透传并跳过缓存写入。
+- 返回头里会带 `X-Proxy-Cache: hit|miss|bypass|refresh|store-skipped`，方便排查是否真的命中了 Worker 缓存。
 
 ## 配置说明
 

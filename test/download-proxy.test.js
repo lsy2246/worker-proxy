@@ -664,6 +664,39 @@ test("rejects unsupported cache strategy values", async () => {
   assert.equal(await response.text(), "Invalid cache parameter");
 });
 
+test("rejects invalid cache_ttl values", async () => {
+  const response = await worker.fetch(
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache_ttl=0"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid cache_ttl parameter");
+});
+
+test("rejects invalid cache_key_mode values", async () => {
+  const response = await worker.fetch(
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache_key_mode=weird"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid cache_key_mode parameter");
+});
+
+test("requires cache_key for custom cache keys", async () => {
+  const response = await worker.fetch(
+    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache_key_mode=custom"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Missing cache_key parameter");
+});
+
 test("rejects unsupported disposition values", async () => {
   const response = await worker.fetch(
     request(
@@ -702,12 +735,203 @@ test("can inspect upstream metadata and media cache status", async () => {
 
     const payload = await response.json();
     assert.equal(payload.mode, "inspect");
-    assert.equal(payload.cache, "prefer");
+    assert.equal(payload.cache, "auto");
     assert.equal(payload.targetUrl, "https://files.example.com/clip.mp4");
     assert.equal(payload.mediaCache.status, "miss");
     assert.equal(payload.upstream.status, 200);
     assert.equal(payload.upstream.contentType, "video/mp4");
     assert.equal(payload.upstream.contentLength, "345");
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("stores proxy responses in Worker cache when cache=prefer and cache_ttl is provided", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    return new Response("cached-body", {
+      headers: {
+        "Content-Type": "image/jpeg",
+      },
+    });
+  };
+
+  try {
+    const first = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg&cache=prefer&cache_ttl=300"),
+      env,
+      {},
+    );
+    const second = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg&cache=prefer&cache_ttl=300"),
+      env,
+      {},
+    );
+
+    assert.equal(await first.text(), "cached-body");
+    assert.equal(await second.text(), "cached-body");
+    assert.equal(second.headers.get("X-Proxy-Cache"), "hit");
+    assert.equal(second.headers.get("Cache-Control"), "public, max-age=300");
+    assert.equal(fetchCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("infers proxy cache ttl from upstream cache-control when cache_ttl is omitted", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    return new Response("ttl-body", {
+      headers: {
+        "Content-Type": "image/jpeg",
+        "Cache-Control": "public, max-age=120",
+      },
+    });
+  };
+
+  try {
+    const first = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg&cache=prefer"),
+      env,
+      {},
+    );
+    const second = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg&cache=prefer"),
+      env,
+      {},
+    );
+
+    assert.equal(await first.text(), "ttl-body");
+    assert.equal(await second.text(), "ttl-body");
+    assert.equal(second.headers.get("X-Proxy-Cache"), "hit");
+    assert.equal(second.headers.get("Cache-Control"), "public, max-age=120");
+    assert.equal(fetchCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("skips proxy cache storage when no ttl can be inferred", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    return new Response("no-ttl", {
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+    });
+  };
+
+  try {
+    const first = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin&cache=prefer"),
+      env,
+      {},
+    );
+    const second = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin&cache=prefer"),
+      env,
+      {},
+    );
+
+    assert.equal(await first.text(), "no-ttl");
+    assert.equal(await second.text(), "no-ttl");
+    assert.equal(first.headers.get("X-Proxy-Cache"), "store-skipped");
+    assert.equal(second.headers.get("X-Proxy-Cache"), "store-skipped");
+    assert.equal(fetchCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("refresh overwrites proxy cache entries", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+
+  globalThis.fetch = async () => {
+    fetchCount += 1;
+    return new Response(`version-${fetchCount}`, {
+      headers: {
+        "Content-Type": "image/jpeg",
+      },
+    });
+  };
+
+  try {
+    await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg&cache=prefer&cache_ttl=300"),
+      env,
+      {},
+    );
+
+    const refreshed = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg&cache=refresh&cache_ttl=300"),
+      env,
+      {},
+    );
+
+    const cachedAgain = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg&cache=prefer&cache_ttl=300"),
+      env,
+      {},
+    );
+
+    assert.equal(await refreshed.text(), "version-2");
+    assert.equal(await cachedAgain.text(), "version-2");
+    assert.equal(refreshed.headers.get("X-Proxy-Cache"), "refresh");
+    assert.equal(cachedAgain.headers.get("X-Proxy-Cache"), "hit");
+    assert.equal(fetchCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+    restoreCache();
+  }
+});
+
+test("reuses proxy cache entries when cache_key_mode=custom and cache_key matches", async () => {
+  const restoreCache = installMockCache();
+  const originalFetch = globalThis.fetch;
+  let fetchCount = 0;
+
+  globalThis.fetch = async (url) => {
+    fetchCount += 1;
+    return new Response(`body-for-${url}`, {
+      headers: {
+        "Content-Type": "image/jpeg",
+      },
+    });
+  };
+
+  try {
+    await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fa.jpg&cache=prefer&cache_ttl=300&cache_key_mode=custom&cache_key=album-cover"),
+      env,
+      {},
+    );
+    const second = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fb.jpg&cache=prefer&cache_ttl=300&cache_key_mode=custom&cache_key=album-cover"),
+      env,
+      {},
+    );
+
+    assert.equal(await second.text(), "body-for-https://files.example.com/a.jpg");
+    assert.equal(second.headers.get("X-Proxy-Cache"), "hit");
+    assert.equal(fetchCount, 1);
   } finally {
     globalThis.fetch = originalFetch;
     restoreCache();
