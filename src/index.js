@@ -827,10 +827,26 @@ async function handleMedia(request, targetUrl, extraHeaders, requestOptions, con
 
   const upstreamHeaders = buildUpstreamHeaders(request, targetUrl, extraHeaders);
   upstreamHeaders.delete("Range");
+  console.log("[media] fetch.start", {
+    targetUrl: targetUrl.href,
+    cache: requestOptions.cache,
+    resolvedCache: requestOptions.resolved_cache,
+    cacheTtl: requestOptions.cache_ttl,
+    hasRange: Boolean(request.headers.get("Range")),
+  });
   const upstreamResponse = await fetch(targetUrl.href, {
     method: "GET",
     headers: upstreamHeaders,
     redirect: "follow",
+  });
+
+  console.log("[media] fetch.response", {
+    targetUrl: targetUrl.href,
+    status: upstreamResponse.status,
+    ok: upstreamResponse.ok,
+    contentType: upstreamResponse.headers.get("Content-Type"),
+    contentLength: upstreamResponse.headers.get("Content-Length"),
+    finalUrl: upstreamResponse.url,
   });
 
   if (!upstreamResponse.ok) {
@@ -839,7 +855,14 @@ async function handleMedia(request, targetUrl, extraHeaders, requestOptions, con
     });
   }
 
+  console.log("[media] buffer.start", {
+    targetUrl: targetUrl.href,
+  });
   const buffer = await upstreamResponse.arrayBuffer();
+  console.log("[media] buffer.ready", {
+    targetUrl: targetUrl.href,
+    byteLength: buffer.byteLength,
+  });
   const resolvedTtl = resolveMediaCacheTtl(requestOptions, upstreamResponse.headers);
 
   if (managedCacheEnabled && cache && cacheRequest && request.method === "GET") {
@@ -847,6 +870,11 @@ async function handleMedia(request, targetUrl, extraHeaders, requestOptions, con
     headers.delete("Content-Range");
     headers.set("Content-Length", String(buffer.byteLength));
 
+    console.log("[media] cache.put.start", {
+      cacheKey: cacheRequest.url,
+      ttl: resolvedTtl,
+      byteLength: buffer.byteLength,
+    });
     await cache.put(
       cacheRequest,
       new Response(buffer.slice(0), {
@@ -854,6 +882,9 @@ async function handleMedia(request, targetUrl, extraHeaders, requestOptions, con
         headers,
       }),
     );
+    console.log("[media] cache.put.ready", {
+      cacheKey: cacheRequest.url,
+    });
   }
 
   const response = buildBufferedMediaResponse(
@@ -960,6 +991,12 @@ export function createWorker(config = {}) {
       try {
         return await handleDownload(request, env, normalizedConfig);
       } catch (error) {
+        console.error("[worker] unhandled.fetch.error", {
+          url: request.url,
+          method: request.method,
+          message: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        });
         return textResponse("Upstream request failed", 502);
       }
     },
