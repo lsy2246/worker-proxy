@@ -196,6 +196,14 @@ function resolveRawTarget(requestUrl, config) {
   const pathSuffix = getProxyPathSuffix(requestUrl.pathname, config.proxy_path);
 
   if (pathSuffix) {
+    if (/^https?%3a%2f%2f/i.test(pathSuffix)) {
+      try {
+        return decodeURIComponent(pathSuffix);
+      } catch {
+        return pathSuffix;
+      }
+    }
+
     return pathSuffix;
   }
 

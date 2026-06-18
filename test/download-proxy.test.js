@@ -178,6 +178,29 @@ test("uses explicit protocol from path targets", async () => {
   }
 });
 
+test("accepts URL-encoded absolute path targets", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, "https://photos.app.goo.gl/M62Uxp4Uz2CUwie9A");
+    assert.equal(init.headers.get("User-Agent"), "Mozilla/5.0 test");
+    return new Response("ok");
+  };
+
+  try {
+    const extraHeaders = encodeURIComponent(JSON.stringify({ "User-Agent": "Mozilla/5.0 test" }));
+    const response = await worker.fetch(
+      request(`/api/file/https%3A%2F%2Fphotos.app.goo.gl%2FM62Uxp4Uz2CUwie9A?_headers=${extraHeaders}`),
+      { PROXY_PASSWORD: "" },
+      {},
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("does not support target query fields as proxy targets", async () => {
   const urlResponse = await worker.fetch(
     request("/api/file?_key=secret&_url=https%3A%2F%2Ffiles.example.com%2Ffrom-query.txt"),
