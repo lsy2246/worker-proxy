@@ -281,6 +281,22 @@ function buildRefererRecoveredRequest(request, config) {
   return new Request(recoveredUrl.href, request);
 }
 
+function isTopLevelNavigationRequest(request) {
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    return false;
+  }
+
+  const fetchMode = (request.headers.get("Sec-Fetch-Mode") || "").toLowerCase();
+  const fetchDest = (request.headers.get("Sec-Fetch-Dest") || "").toLowerCase();
+
+  return fetchMode === "navigate" || fetchDest === "document";
+}
+
+function buildSameOriginRedirectLocation(request) {
+  const url = new URL(request.url);
+  return `${url.pathname}${url.search}`;
+}
+
 function parseUpstreamHeaders(value) {
   if (!value) {
     return { headers: {} };
@@ -1664,6 +1680,9 @@ export function createWorker(config = {}) {
 
       if (!matchesProxyPath(url.pathname, normalizedConfig.proxy_path)) {
         proxyRequest = buildRefererRecoveredRequest(request, normalizedConfig);
+        if (proxyRequest && isTopLevelNavigationRequest(request)) {
+          return redirectResponse(buildSameOriginRedirectLocation(proxyRequest));
+        }
 
         if (!proxyRequest) {
           return handleFallback(normalizedConfig);

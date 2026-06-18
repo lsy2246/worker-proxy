@@ -1153,6 +1153,30 @@ test("recovers same-origin navigations from proxied page referers", async () => 
   }
 });
 
+test("redirects top-level same-origin navigations back to recovered proxy paths", async () => {
+  const configuredWorker = createWorker({
+    fallback_mode: "html",
+    fallback_html: "fallback",
+  });
+  const response = await configuredWorker.fetch(
+    request("/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login", {
+      headers: {
+        Referer: "https://proxy.example.test/api/file/x.com",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+      },
+    }),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 302);
+  assert.equal(
+    response.headers.get("Location"),
+    "/api/file/x.com/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login",
+  );
+});
+
 test("keeps fallback for non-proxy paths without proxied referers", async () => {
   const configuredWorker = createWorker({
     fallback_mode: "html",
