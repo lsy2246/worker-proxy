@@ -524,6 +524,59 @@ test("runtime treats same-origin non-proxy URLs as target-site navigations", asy
   }
 });
 
+test("runtime does not wrap already proxied path strings", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("<!doctype html><title>App</title>", {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/cn.pornhub.com/view_video.php?viewkey=65fac95135c8f&_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+    const scriptMatch = /<script data-worker-proxy-runtime>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(scriptMatch);
+
+    let fetchedUrl = "";
+    const sandbox = {
+      URL,
+      Request,
+      location: new URL("https://proxy.example.test/api/file/cn.pornhub.com/view_video.php?viewkey=65fac95135c8f&_key=secret"),
+      window: {
+        fetch(input) {
+          fetchedUrl = typeof input === "string" ? input : input.url;
+          return Promise.resolve(new Response("ok"));
+        },
+      },
+      XMLHttpRequest: function XMLHttpRequest() {},
+      navigator: {},
+      HTMLFormElement: function HTMLFormElement() {},
+      history: {},
+      document: {
+        addEventListener() {},
+      },
+    };
+    sandbox.XMLHttpRequest.prototype.open = function open() {};
+    sandbox.HTMLFormElement.prototype.submit = function submit() {};
+
+    vm.runInNewContext(scriptMatch[1], sandbox);
+    await sandbox.window.fetch("/api/file/cn.pornhub.com/view_video.php?viewkey=65fac95135c8f");
+
+    assert.equal(
+      fetchedUrl,
+      "/api/file/cn.pornhub.com/view_video.php?viewkey=65fac95135c8f",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("runtime leaves SPA history route updates visible to the app router", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>

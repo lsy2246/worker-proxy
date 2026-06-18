@@ -668,6 +668,10 @@ function buildRuntimeScript(baseUrl, config, requestOptions) {
     }
 
     try {
+      if (value === proxyPath || value.startsWith(proxyPath + "/")) {
+        return value;
+      }
+
       let target = new URL(value, baseTargetUrl);
       if (alreadyProxied(target)) {
         return value;
