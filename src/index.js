@@ -722,20 +722,6 @@ function buildRuntimeScript(baseUrl, config, requestOptions) {
     };
   }
 
-  const originalPushState = history && history.pushState;
-  if (originalPushState) {
-    history.pushState = function(state, title, url) {
-      return originalPushState.call(this, state, title, url == null ? url : proxifyUrl(String(url)));
-    };
-  }
-
-  const originalReplaceState = history && history.replaceState;
-  if (originalReplaceState) {
-    history.replaceState = function(state, title, url) {
-      return originalReplaceState.call(this, state, title, url == null ? url : proxifyUrl(String(url)));
-    };
-  }
-
   document.addEventListener("click", (event) => {
     const link = event.target && event.target.closest && event.target.closest("a[href]");
     if (!link || event.defaultPrevented || link.target || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
