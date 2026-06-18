@@ -58,14 +58,11 @@ const CORS_HEADERS = {
   "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Range, Content-Type, Accept-Ranges",
 };
 
-const VALID_MODES = new Set(["proxy", "media", "inspect"]);
-const VALID_CACHE_STRATEGIES = new Set(["auto", "off", "prefer", "bypass", "refresh"]);
-const VALID_CACHE_KEY_MODES = new Set(["auto", "full", "ignore_search", "custom"]);
+const VALID_MODES = new Set(["proxy", "inspect"]);
 const VALID_DISPOSITIONS = new Set(["inline", "attachment"]);
-const MEDIA_CACHE_PATH = "/__media_cache__";
 const PROXY_CACHE_PATH = "/__proxy_cache__";
 const MAX_MANAGED_CACHE_TTL = 31536000;
-const DEFAULT_MEDIA_CACHE_TTL = 86400;
+const DEFAULT_RANGE_CACHE_TTL = 86400;
 
 function textResponse(message, status, extraHeaders = {}) {
   return new Response(message, {
@@ -240,70 +237,21 @@ function parseUpstreamHeaders(value) {
 
 function parseRequestOptions(url) {
   const mode = (url.searchParams.get("mode") || "proxy").trim().toLowerCase();
-  const cache = (url.searchParams.get("cache") || "auto").trim().toLowerCase();
   const dispositionValue = url.searchParams.get("disposition");
   const disposition = dispositionValue ? dispositionValue.trim().toLowerCase() : null;
-  const cacheTtl = parsePositiveInteger(url.searchParams.get("cache_ttl"));
-  const cacheKeyMode = (url.searchParams.get("cache_key_mode") || "auto").trim().toLowerCase();
-  const cacheKeyValue = url.searchParams.get("cache_key");
-  const cacheKey = cacheKeyValue === null ? null : cacheKeyValue.trim();
 
   if (!VALID_MODES.has(mode)) {
     return { error: "Invalid mode parameter" };
-  }
-
-  if (!VALID_CACHE_STRATEGIES.has(cache)) {
-    return { error: "Invalid cache parameter" };
   }
 
   if (disposition && !VALID_DISPOSITIONS.has(disposition)) {
     return { error: "Invalid disposition parameter" };
   }
 
-  if (cacheTtl?.error) {
-    return { error: "Invalid cache_ttl parameter" };
-  }
-
-  if (!VALID_CACHE_KEY_MODES.has(cacheKeyMode)) {
-    return { error: "Invalid cache_key_mode parameter" };
-  }
-
-  if (cacheKeyMode === "custom" && !cacheKey) {
-    return { error: "Missing cache_key parameter" };
-  }
-
   return {
     mode,
-    cache,
     disposition,
-    cache_ttl: cacheTtl,
-    cache_key_mode: cacheKeyMode,
-    cache_key: cacheKey,
-    resolved_cache: resolveCacheStrategy(mode, cache),
   };
-}
-
-function parsePositiveInteger(value) {
-  if (value === null || value === undefined || value === "") {
-    return null;
-  }
-
-  if (!/^\d+$/.test(value)) {
-    return { error: true };
-  }
-
-  const parsed = Number.parseInt(value, 10);
-  return parsed > 0 ? parsed : { error: true };
-}
-
-function resolveCacheStrategy(mode, cache) {
-  const normalizedCache = cache === "bypass" ? "off" : cache;
-
-  if (normalizedCache === "auto") {
-    return mode === "media" ? "prefer" : "off";
-  }
-
-  return normalizedCache;
 }
 
 function buildPreflightHeaders(request) {
@@ -439,7 +387,7 @@ async function buildProxyResponse(upstreamResponse, config) {
   });
 }
 
-function buildMediaHeaders(upstreamHeaders, config, ttl = DEFAULT_MEDIA_CACHE_TTL) {
+function buildRangeResponseHeaders(upstreamHeaders, config, ttl = DEFAULT_RANGE_CACHE_TTL) {
   const headers = buildResponseHeaders(upstreamHeaders, config);
   headers.set("Accept-Ranges", "bytes");
 
@@ -513,9 +461,9 @@ function buildRangeNotSatisfiableResponse(totalLength, disposition) {
   });
 }
 
-function buildBufferedMediaResponse(buffer, upstreamHeaders, request, config, disposition, ttl = DEFAULT_MEDIA_CACHE_TTL) {
+function buildBufferedRangeResponse(buffer, upstreamHeaders, request, config, disposition, ttl = DEFAULT_RANGE_CACHE_TTL) {
   const totalLength = buffer.byteLength;
-  const headers = buildMediaHeaders(upstreamHeaders, config, ttl);
+  const headers = buildRangeResponseHeaders(upstreamHeaders, config, ttl);
   const range = parseSingleRangeHeader(request.headers.get("Range"), totalLength);
 
   if (range.type === "invalid") {
@@ -556,19 +504,6 @@ function serializeCacheHeaders(extraHeaders) {
     .join("\n");
 }
 
-function resolveCacheResourceIdentity(targetUrl, requestOptions) {
-  switch (requestOptions.cache_key_mode) {
-    case "custom":
-      return requestOptions.cache_key;
-    case "ignore_search":
-      return `${targetUrl.origin}${targetUrl.pathname}`;
-    case "auto":
-    case "full":
-    default:
-      return targetUrl.href;
-  }
-}
-
 async function buildScopedCacheRequest(cachePath, requestUrl, resourceIdentity, extraHeaders) {
   const serializedHeaders = serializeCacheHeaders(extraHeaders);
   const cacheKey = await hashText(`${resourceIdentity}\n${serializedHeaders}`);
@@ -581,14 +516,8 @@ async function buildScopedCacheRequest(cachePath, requestUrl, resourceIdentity, 
   });
 }
 
-async function buildMediaCacheRequest(requestUrl, targetUrl, extraHeaders, requestOptions) {
-  const resourceIdentity = resolveCacheResourceIdentity(targetUrl, requestOptions);
-  return buildScopedCacheRequest(MEDIA_CACHE_PATH, requestUrl, resourceIdentity, extraHeaders);
-}
-
-async function buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders, requestOptions) {
-  const resourceIdentity = resolveCacheResourceIdentity(targetUrl, requestOptions);
-  return buildScopedCacheRequest(PROXY_CACHE_PATH, requestUrl, resourceIdentity, extraHeaders);
+async function buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders) {
+  return buildScopedCacheRequest(PROXY_CACHE_PATH, requestUrl, targetUrl.href, extraHeaders);
 }
 
 function clampCacheTtl(ttl) {
@@ -602,7 +531,7 @@ function clampCacheTtl(ttl) {
 function resolveUpstreamCacheTtl(upstreamHeaders) {
   const cacheControl = upstreamHeaders.get("Cache-Control") || "";
 
-  if (/\bno-store\b/i.test(cacheControl)) {
+  if (/\b(?:no-store|no-cache|private)\b/i.test(cacheControl)) {
     return null;
   }
 
@@ -636,23 +565,22 @@ function resolveUpstreamCacheTtl(upstreamHeaders) {
 }
 
 function resolveProxyCacheTtl(requestOptions, upstreamHeaders) {
-  if (requestOptions.cache_ttl) {
-    return clampCacheTtl(requestOptions.cache_ttl);
-  }
-
   return resolveUpstreamCacheTtl(upstreamHeaders);
 }
 
-function resolveMediaCacheTtl(requestOptions, upstreamHeaders) {
-  if (requestOptions.cache_ttl) {
-    return clampCacheTtl(requestOptions.cache_ttl);
-  }
-
-  return resolveUpstreamCacheTtl(upstreamHeaders) || DEFAULT_MEDIA_CACHE_TTL;
+function resolveRangeCacheTtl(requestOptions, upstreamHeaders) {
+  return resolveUpstreamCacheTtl(upstreamHeaders) || DEFAULT_RANGE_CACHE_TTL;
 }
 
-function canUseManagedCache(config, requestOptions) {
-  return !config.disable_cache && requestOptions.resolved_cache !== "off";
+function canUseManagedCache(config) {
+  return !config.disable_cache;
+}
+
+function requestRequiresCacheRefresh(request) {
+  const cacheControl = request.headers.get("Cache-Control") || "";
+  const pragma = request.headers.get("Pragma") || "";
+
+  return /\b(?:no-cache|max-age=0)\b/i.test(cacheControl) || /\bno-cache\b/i.test(pragma);
 }
 
 async function cacheResponseBody(cache, cacheRequest, response, ttl, config) {
@@ -679,18 +607,15 @@ async function cacheResponseBody(cache, cacheRequest, response, ttl, config) {
 async function handleProxy(request, targetUrl, extraHeaders, requestOptions, config) {
   const requestUrl = new URL(request.url);
   const cache = getDefaultCache();
-  const managedCacheEnabled = canUseManagedCache(config, requestOptions);
+  const managedCacheEnabled = canUseManagedCache(config);
+  const shouldRefreshCache = requestRequiresCacheRefresh(request);
+  const rangeHeader = request.headers.get("Range");
   const cacheRequest = managedCacheEnabled
-    ? await buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders, requestOptions)
+    ? await buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders)
     : null;
 
-  if (
-    managedCacheEnabled &&
-    requestOptions.resolved_cache === "prefer" &&
-    cache &&
-    cacheRequest
-  ) {
-    const cachedResponse = await cache.match(cacheRequest);
+  if (managedCacheEnabled && !shouldRefreshCache && cache && cacheRequest) {
+    const cachedResponse = await cache.match(buildCacheLookupRequest(cacheRequest, request));
 
     if (cachedResponse) {
       return finalizeResponse(cachedResponse, request.method, requestOptions.disposition, {
@@ -707,6 +632,44 @@ async function handleProxy(request, targetUrl, extraHeaders, requestOptions, con
 
   const proxyResponse = await buildProxyResponse(upstreamResponse, config);
 
+  if (rangeHeader && upstreamResponse.status === 200 && proxyResponse.ok) {
+    const buffer = await proxyResponse.clone().arrayBuffer();
+    const resolvedTtl = resolveRangeCacheTtl(requestOptions, upstreamResponse.headers);
+
+    if (managedCacheEnabled && cache && cacheRequest && request.method === "GET") {
+      const headers = buildRangeResponseHeaders(upstreamResponse.headers, config, resolvedTtl);
+      headers.delete("Content-Range");
+      headers.set("Content-Length", String(buffer.byteLength));
+
+      await cache.put(
+        cacheRequest,
+        new Response(buffer.slice(0), {
+          status: 200,
+          headers,
+        }),
+      );
+    }
+
+    const response = buildBufferedRangeResponse(
+      buffer,
+      upstreamResponse.headers,
+      request,
+      config,
+      requestOptions.disposition,
+      resolvedTtl,
+    );
+
+    const cacheStatus = !managedCacheEnabled
+      ? "bypass"
+      : shouldRefreshCache
+        ? "refresh"
+        : "miss";
+
+    return finalizeResponse(response, request.method, requestOptions.disposition, {
+      "X-Proxy-Cache": cacheStatus,
+    });
+  }
+
   if (!managedCacheEnabled || !proxyResponse.ok || request.method !== "GET" || !cache || !cacheRequest) {
     return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
       "X-Proxy-Cache": "bypass",
@@ -714,7 +677,7 @@ async function handleProxy(request, targetUrl, extraHeaders, requestOptions, con
   }
 
   const resolvedTtl = resolveProxyCacheTtl(requestOptions, upstreamResponse.headers);
-  const cacheStatus = requestOptions.resolved_cache === "refresh" ? "refresh" : "miss";
+  const cacheStatus = shouldRefreshCache ? "refresh" : "miss";
 
   if (!resolvedTtl) {
     return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
@@ -725,7 +688,6 @@ async function handleProxy(request, targetUrl, extraHeaders, requestOptions, con
   await cacheResponseBody(cache, cacheRequest, proxyResponse, resolvedTtl, config);
 
   return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
-    "Cache-Control": `public, max-age=${resolvedTtl}`,
     "X-Proxy-Cache": cacheStatus,
   });
 }
@@ -763,16 +725,15 @@ async function fetchUpstreamMetadata(request, targetUrl, extraHeaders) {
 async function handleInspect(request, targetUrl, extraHeaders, requestOptions, config) {
   const requestUrl = new URL(request.url);
   const cache = getDefaultCache();
-  const cacheRequest = await buildMediaCacheRequest(requestUrl, targetUrl, extraHeaders, requestOptions);
+  const cacheRequest = await buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders);
   const cachedResponse = cache ? await cache.match(cacheRequest) : null;
   const upstreamResponse = await fetchUpstreamMetadata(request, targetUrl, extraHeaders);
 
   return jsonResponse({
     mode: requestOptions.mode,
-    cache: requestOptions.cache,
     disposition: requestOptions.disposition,
     targetUrl: targetUrl.href,
-    mediaCache: {
+    proxyCache: {
       key: cacheRequest.url,
       status: cache ? (cachedResponse ? "hit" : "miss") : "unavailable",
       enabled: !config.disable_cache,
@@ -786,124 +747,6 @@ async function handleInspect(request, targetUrl, extraHeaders, requestOptions, c
       acceptRanges: upstreamResponse.headers.get("Accept-Ranges"),
       contentRange: upstreamResponse.headers.get("Content-Range"),
     },
-  });
-}
-
-async function cacheMediaResponse(cache, cacheRequest, upstreamHeaders, buffer, config) {
-  if (!cache || config.disable_cache) {
-    return;
-  }
-
-  const headers = buildMediaHeaders(upstreamHeaders, config, resolveMediaCacheTtl({ cache_ttl: null }, upstreamHeaders));
-  headers.delete("Content-Range");
-  headers.set("Content-Length", String(buffer.byteLength));
-
-  await cache.put(
-    cacheRequest,
-    new Response(buffer.slice(0), {
-      status: 200,
-      headers,
-    }),
-  );
-}
-
-async function handleMedia(request, targetUrl, extraHeaders, requestOptions, config) {
-  const requestUrl = new URL(request.url);
-  const cache = getDefaultCache();
-  const managedCacheEnabled = canUseManagedCache(config, requestOptions);
-  const cacheRequest = managedCacheEnabled
-    ? await buildMediaCacheRequest(requestUrl, targetUrl, extraHeaders, requestOptions)
-    : null;
-
-  if (managedCacheEnabled && requestOptions.resolved_cache === "prefer" && cache && cacheRequest) {
-    const cachedResponse = await cache.match(buildCacheLookupRequest(cacheRequest, request));
-
-    if (cachedResponse) {
-      return finalizeResponse(cachedResponse, request.method, requestOptions.disposition, {
-        "X-Proxy-Cache": "hit",
-      });
-    }
-  }
-
-  const upstreamHeaders = buildUpstreamHeaders(request, targetUrl, extraHeaders);
-  upstreamHeaders.delete("Range");
-  console.log("[media] fetch.start", {
-    targetUrl: targetUrl.href,
-    cache: requestOptions.cache,
-    resolvedCache: requestOptions.resolved_cache,
-    cacheTtl: requestOptions.cache_ttl,
-    hasRange: Boolean(request.headers.get("Range")),
-  });
-  const upstreamResponse = await fetch(targetUrl.href, {
-    method: "GET",
-    headers: upstreamHeaders,
-    redirect: "follow",
-  });
-
-  console.log("[media] fetch.response", {
-    targetUrl: targetUrl.href,
-    status: upstreamResponse.status,
-    ok: upstreamResponse.ok,
-    contentType: upstreamResponse.headers.get("Content-Type"),
-    contentLength: upstreamResponse.headers.get("Content-Length"),
-    finalUrl: upstreamResponse.url,
-  });
-
-  if (!upstreamResponse.ok) {
-    return finalizeResponse(await buildProxyResponse(upstreamResponse, config), request.method, requestOptions.disposition, {
-      "X-Proxy-Cache": "bypass",
-    });
-  }
-
-  console.log("[media] buffer.start", {
-    targetUrl: targetUrl.href,
-  });
-  const buffer = await upstreamResponse.arrayBuffer();
-  console.log("[media] buffer.ready", {
-    targetUrl: targetUrl.href,
-    byteLength: buffer.byteLength,
-  });
-  const resolvedTtl = resolveMediaCacheTtl(requestOptions, upstreamResponse.headers);
-
-  if (managedCacheEnabled && cache && cacheRequest && request.method === "GET") {
-    const headers = buildMediaHeaders(upstreamResponse.headers, config, resolvedTtl);
-    headers.delete("Content-Range");
-    headers.set("Content-Length", String(buffer.byteLength));
-
-    console.log("[media] cache.put.start", {
-      cacheKey: cacheRequest.url,
-      ttl: resolvedTtl,
-      byteLength: buffer.byteLength,
-    });
-    await cache.put(
-      cacheRequest,
-      new Response(buffer.slice(0), {
-        status: 200,
-        headers,
-      }),
-    );
-    console.log("[media] cache.put.ready", {
-      cacheKey: cacheRequest.url,
-    });
-  }
-
-  const response = buildBufferedMediaResponse(
-    buffer,
-    upstreamResponse.headers,
-    request,
-    config,
-    requestOptions.disposition,
-    resolvedTtl,
-  );
-
-  const cacheStatus = !managedCacheEnabled
-    ? "bypass"
-    : requestOptions.resolved_cache === "refresh"
-      ? "refresh"
-      : "miss";
-
-  return finalizeResponse(response, request.method, requestOptions.disposition, {
-    "X-Proxy-Cache": cacheStatus,
   });
 }
 
@@ -944,12 +787,7 @@ async function handleDownload(request, env, config) {
 
   const {
     mode,
-    cache,
     disposition,
-    cache_ttl,
-    cache_key_mode,
-    cache_key,
-    resolved_cache,
     error: optionsError,
   } = parseRequestOptions(requestUrl);
   if (optionsError) {
@@ -958,20 +796,11 @@ async function handleDownload(request, env, config) {
 
   const requestOptions = {
     mode,
-    cache,
     disposition,
-    cache_ttl,
-    cache_key_mode,
-    cache_key,
-    resolved_cache,
   };
 
   if (requestOptions.mode === "inspect") {
     return handleInspect(request, targetUrl, extraHeaders, requestOptions, config);
-  }
-
-  if (requestOptions.mode === "media") {
-    return handleMedia(request, targetUrl, extraHeaders, requestOptions, config);
   }
 
   return handleProxy(request, targetUrl, extraHeaders, requestOptions, config);

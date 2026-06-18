@@ -653,50 +653,6 @@ test("rejects unsupported mode values", async () => {
   assert.equal(await response.text(), "Invalid mode parameter");
 });
 
-test("rejects unsupported cache strategy values", async () => {
-  const response = await worker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache=force"),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Invalid cache parameter");
-});
-
-test("rejects invalid cache_ttl values", async () => {
-  const response = await worker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache_ttl=0"),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Invalid cache_ttl parameter");
-});
-
-test("rejects invalid cache_key_mode values", async () => {
-  const response = await worker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache_key_mode=weird"),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Invalid cache_key_mode parameter");
-});
-
-test("requires cache_key for custom cache keys", async () => {
-  const response = await worker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&cache_key_mode=custom"),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Missing cache_key parameter");
-});
-
 test("rejects unsupported disposition values", async () => {
   const response = await worker.fetch(
     request(
@@ -710,7 +666,7 @@ test("rejects unsupported disposition values", async () => {
   assert.equal(await response.text(), "Invalid disposition parameter");
 });
 
-test("can inspect upstream metadata and media cache status", async () => {
+test("can inspect upstream metadata and proxy cache status", async () => {
   const restoreCache = installMockCache();
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
@@ -735,9 +691,8 @@ test("can inspect upstream metadata and media cache status", async () => {
 
     const payload = await response.json();
     assert.equal(payload.mode, "inspect");
-    assert.equal(payload.cache, "auto");
     assert.equal(payload.targetUrl, "https://files.example.com/clip.mp4");
-    assert.equal(payload.mediaCache.status, "miss");
+    assert.equal(payload.proxyCache.status, "miss");
     assert.equal(payload.upstream.status, 200);
     assert.equal(payload.upstream.contentType, "video/mp4");
     assert.equal(payload.upstream.contentLength, "345");
@@ -747,7 +702,7 @@ test("can inspect upstream metadata and media cache status", async () => {
   }
 });
 
-test("stores proxy responses in Worker cache when cache=prefer and cache_ttl is provided", async () => {
+test("stores proxy responses in Worker cache when upstream cache-control allows it", async () => {
   const restoreCache = installMockCache();
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
@@ -757,18 +712,19 @@ test("stores proxy responses in Worker cache when cache=prefer and cache_ttl is 
     return new Response("cached-body", {
       headers: {
         "Content-Type": "image/jpeg",
+        "Cache-Control": "public, max-age=300",
       },
     });
   };
 
   try {
     const first = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg&cache=prefer&cache_ttl=300"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg"),
       env,
       {},
     );
     const second = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg&cache=prefer&cache_ttl=300"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg"),
       env,
       {},
     );
@@ -784,7 +740,7 @@ test("stores proxy responses in Worker cache when cache=prefer and cache_ttl is 
   }
 });
 
-test("infers proxy cache ttl from upstream cache-control when cache_ttl is omitted", async () => {
+test("infers proxy cache ttl from upstream cache-control", async () => {
   const restoreCache = installMockCache();
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
@@ -801,12 +757,12 @@ test("infers proxy cache ttl from upstream cache-control when cache_ttl is omitt
 
   try {
     const first = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg&cache=prefer"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg"),
       env,
       {},
     );
     const second = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg&cache=prefer"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg"),
       env,
       {},
     );
@@ -838,12 +794,12 @@ test("skips proxy cache storage when no ttl can be inferred", async () => {
 
   try {
     const first = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin&cache=prefer"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin"),
       env,
       {},
     );
     const second = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin&cache=prefer"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin"),
       env,
       {},
     );
@@ -859,7 +815,7 @@ test("skips proxy cache storage when no ttl can be inferred", async () => {
   }
 });
 
-test("refresh overwrites proxy cache entries", async () => {
+test("request cache-control no-cache refreshes proxy cache entries", async () => {
   const restoreCache = installMockCache();
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
@@ -869,25 +825,30 @@ test("refresh overwrites proxy cache entries", async () => {
     return new Response(`version-${fetchCount}`, {
       headers: {
         "Content-Type": "image/jpeg",
+        "Cache-Control": "public, max-age=300",
       },
     });
   };
 
   try {
     await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg&cache=prefer&cache_ttl=300"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg"),
       env,
       {},
     );
 
     const refreshed = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg&cache=refresh&cache_ttl=300"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg", {
+        headers: {
+          "Cache-Control": "no-cache",
+        },
+      }),
       env,
       {},
     );
 
     const cachedAgain = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg&cache=prefer&cache_ttl=300"),
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg"),
       env,
       {},
     );
@@ -903,42 +864,47 @@ test("refresh overwrites proxy cache entries", async () => {
   }
 });
 
-test("reuses proxy cache entries when cache_key_mode=custom and cache_key matches", async () => {
-  const restoreCache = installMockCache();
+test("forwards standard range requests when upstream supports partial content", async () => {
   const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, "https://files.example.com/clip.mp4");
+    assert.equal(init.method, "GET");
+    assert.equal(init.headers.get("Range"), "bytes=2-5");
 
-  globalThis.fetch = async (url) => {
-    fetchCount += 1;
-    return new Response(`body-for-${url}`, {
+    return new Response("2345", {
+      status: 206,
+      statusText: "Partial Content",
       headers: {
-        "Content-Type": "image/jpeg",
+        "Content-Type": "video/mp4",
+        "Content-Length": "4",
+        "Content-Range": "bytes 2-5/10",
+        "Accept-Ranges": "bytes",
       },
     });
   };
 
   try {
-    await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fa.jpg&cache=prefer&cache_ttl=300&cache_key_mode=custom&cache_key=album-cover"),
-      env,
-      {},
-    );
-    const second = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fb.jpg&cache=prefer&cache_ttl=300&cache_key_mode=custom&cache_key=album-cover"),
+    const response = await worker.fetch(
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
+        headers: {
+          Range: "bytes=2-5",
+        },
+      }),
       env,
       {},
     );
 
-    assert.equal(await second.text(), "body-for-https://files.example.com/a.jpg");
-    assert.equal(second.headers.get("X-Proxy-Cache"), "hit");
-    assert.equal(fetchCount, 1);
+    assert.equal(response.status, 206);
+    assert.equal(response.headers.get("Accept-Ranges"), "bytes");
+    assert.equal(response.headers.get("Content-Range"), "bytes 2-5/10");
+    assert.equal(response.headers.get("Content-Length"), "4");
+    assert.equal(await response.text(), "2345");
   } finally {
     globalThis.fetch = originalFetch;
-    restoreCache();
   }
 });
 
-test("serves seekable media responses and warms the cache on the first request", async () => {
+test("serves seekable range responses from ordinary proxy requests when upstream returns a full body", async () => {
   const restoreCache = installMockCache();
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
@@ -946,7 +912,7 @@ test("serves seekable media responses and warms the cache on the first request",
     fetchCount += 1;
     assert.equal(url, "https://files.example.com/clip.mp4");
     assert.equal(init.method, "GET");
-    assert.equal(init.headers.get("Range"), null);
+    assert.equal(init.headers.get("Range"), "bytes=2-5");
 
     return new Response("0123456789", {
       status: 200,
@@ -960,7 +926,7 @@ test("serves seekable media responses and warms the cache on the first request",
 
   try {
     const response = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media", {
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
         headers: {
           Range: "bytes=2-5",
         },
@@ -981,7 +947,7 @@ test("serves seekable media responses and warms the cache on the first request",
   }
 });
 
-test("reuses the cached media body for later range requests", async () => {
+test("reuses the cached full body for later ordinary range requests", async () => {
   const restoreCache = installMockCache();
   const originalFetch = globalThis.fetch;
   let fetchCount = 0;
@@ -999,7 +965,7 @@ test("reuses the cached media body for later range requests", async () => {
 
   try {
     await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media", {
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
         headers: {
           Range: "bytes=0-3",
         },
@@ -1009,7 +975,7 @@ test("reuses the cached media body for later range requests", async () => {
     );
 
     const secondResponse = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media", {
+      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
         headers: {
           Range: "bytes=4-7",
         },
@@ -1021,55 +987,6 @@ test("reuses the cached media body for later range requests", async () => {
     assert.equal(secondResponse.status, 206);
     assert.equal(await secondResponse.text(), "efgh");
     assert.equal(fetchCount, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreCache();
-  }
-});
-
-test("bypasses media cache when cache=bypass is requested", async () => {
-  const restoreCache = installMockCache();
-  const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-
-    return new Response("klmnopqrst", {
-      status: 200,
-      headers: {
-        "Content-Type": "video/mp4",
-        "Content-Length": "10",
-      },
-    });
-  };
-
-  try {
-    await worker.fetch(
-      request(
-        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media&cache=bypass",
-        {
-          headers: {
-            Range: "bytes=0-1",
-          },
-        },
-      ),
-      env,
-      {},
-    );
-    await worker.fetch(
-      request(
-        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=media&cache=bypass",
-        {
-          headers: {
-            Range: "bytes=2-3",
-          },
-        },
-      ),
-      env,
-      {},
-    );
-
-    assert.equal(fetchCount, 2);
   } finally {
     globalThis.fetch = originalFetch;
     restoreCache();

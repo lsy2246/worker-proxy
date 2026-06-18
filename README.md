@@ -6,11 +6,10 @@
 
 - `/download?url=...` 下载代理
 - 支持 `GET`、`HEAD` 和浏览器 CORS 预检 `OPTIONS`
-- 支持 `Range` 请求，下载器可以断点续传，前提是源站也支持
-- 支持 `mode=proxy|media|inspect` 三种处理模式
-- 支持请求驱动的代理缓存控制，例如 `cache=auto|off|prefer|refresh`
+- 支持标准 `Range` 请求；源站不支持 Range 但返回完整文件时，Worker 会尝试合成 `206 Partial Content`
+- 支持 `mode=inspect` 调试模式
+- 普通代理缓存只遵循上游 HTTP 响应缓存头，例如 `Cache-Control` 和 `Expires`
 - 支持 `disposition=inline|attachment` 响应头覆盖
-- `mode=media` 会把完整媒体拉到 Cloudflare Cache API，再由 Worker 自己提供可拖拽的 `206 Partial Content`
 - `mode=inspect` 会返回 JSON 元数据，方便排查源站和缓存状态
 - 密码通过查询参数传递：`?key=你的密码`
 - 保留常见下载响应头，例如 `Content-Type`、`Content-Length`、`Content-Disposition`、`Content-Range`
@@ -79,26 +78,8 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 除了 `url`、`key` 和 `headers`，现在还支持下面几个可选参数：
 
 - `mode`
-  - `proxy`：默认值。透传上游响应，适合图片、普通文件、原本就支持 Range 的源站。
-  - `media`：媒体模式。先完整拉取资源，再缓存为可 seek 的下载体，适合视频。
+  - `proxy`：默认值。透传上游响应，适合图片、普通文件和标准媒体请求。
   - `inspect`：只返回 JSON，不返回文件内容，用来查看源站状态和缓存状态。
-- `cache`
-  - `auto`：默认值。偏保守。`mode=proxy` 不主动写 Worker 缓存，`mode=media` 保持现有媒体缓存行为。
-  - `off`：完全跳过 Worker 管理的缓存。
-  - `prefer`：优先读 Worker 缓存，未命中时拉取上游并尝试回填缓存。
-  - `refresh`：忽略旧缓存，强制重新拉取并覆盖缓存。
-  - `bypass`：兼容旧参数，等价于 `off`。
-- `cache_ttl`
-  - 传秒数，例如 `300`、`3600`、`2592000`。
-  - 只在 Worker 管理的缓存启用时生效。
-  - 不传时会自动从上游响应头推导 TTL。
-- `cache_key_mode`
-  - `auto`：默认值。当前实现等价于完整 URL。
-  - `full`：按完整 URL 生成缓存键。
-  - `ignore_search`：忽略查询参数，只按域名和路径生成缓存键。
-  - `custom`：配合 `cache_key` 手动指定缓存资源身份。
-- `cache_key`
-  - 只有 `cache_key_mode=custom` 时需要。
 - `disposition`
   - `inline`：尽量让浏览器直接打开。
   - `attachment`：尽量让浏览器按附件下载。
@@ -109,40 +90,10 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 /download?key=你的密码&url=https%3A%2F%2Fexample.com%2Ffile.zip
 ```
 
-示例：视频拖拽模式
-
-```text
-/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=media
-```
-
-示例：给图片启用 30 天代理缓存
-
-```text
-/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fposter.jpg&cache=prefer&cache_ttl=2592000
-```
-
-示例：给清单接口启用 5 分钟代理缓存
-
-```text
-/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Ffeed.json&cache=prefer&cache_ttl=300
-```
-
-示例：强制刷新媒体缓存
-
-```text
-/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=media&cache=refresh
-```
-
 示例：查看当前资源信息
 
 ```text
 /download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fclip.mp4&mode=inspect
-```
-
-示例：两个不同 URL 共用同一份缓存键
-
-```text
-/download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fa.jpg&cache=prefer&cache_ttl=300&cache_key_mode=custom&cache_key=album-cover
 ```
 
 示例：覆盖 `Content-Disposition`
@@ -151,33 +102,36 @@ const proxyUrl = `http://localhost:8787/download?key=你的密码&url=${targetUr
 /download?key=你的密码&url=https%3A%2F%2Fexample.com%2Fdemo.bin&disposition=inline
 ```
 
-## 媒体模式说明
+## Range 请求说明
 
-`mode=media` 的目标不是“把浏览器的 `Range` 原样转发给上游”，而是“把原本不支持 seek 的上游资源，转换成浏览器可拖拽的 `206 Partial Content` 响应”。
+Worker 不需要专门的私有媒体参数。浏览器或下载器如果需要拖拽、断点续传，会发送标准请求头：
+
+```http
+Range: bytes=...
+```
 
 处理流程是：
 
-1. 浏览器首次请求媒体资源时，Worker 会先完整拉取上游文件。
-2. Worker 会把完整响应写入 Cloudflare Cache API。
-3. 当前请求会直接由 Worker 根据完整内容生成 `206` 或 `200` 响应。
-4. 后续请求会优先命中 Cloudflare Cache，并继续支持 `Range` 拖拽。
+1. Worker 默认把 `Range` 请求头转发给上游。
+2. 如果上游返回标准 `206 Partial Content`，Worker 直接透传。
+3. 如果上游忽略 `Range` 并返回完整 `200`，Worker 会读取完整 body，按请求的 Range 合成 `206`。
+4. 合成 `206` 时，Worker 会把完整 body 写入 Cloudflare Cache API，后续 Range 请求可以直接从缓存体切片返回。
 
 注意事项：
 
-- `mode=media` 首次请求的等待时间通常会比普通透传更长，因为它需要先拿到完整媒体。
+- 当上游不支持 Range 时，首次 Range 请求通常会比直接透传更慢，因为 Worker 需要先拿到完整文件。
 - Cloudflare Cache API 是边缘缓存，不保证所有数据中心都已经预热。
-- 如果你把 `disable_cache` 设为 `true`，媒体模式仍能工作，但每次都会重新拉取上游文件。
-- 这个模式最适合“源站能整文件下载，但不能标准 Range seek”的视频源。
+- 如果你把 `disable_cache` 设为 `true`，Range 合成仍能工作，但每次都需要重新拉取上游文件。
+- 这个增强最适合“源站能整文件下载，但不能标准 Range seek”的视频源，不适合无限制地代理超大文件。
 
 ## 代理缓存说明
 
-Worker 现在支持“请求驱动的代理缓存”：
+Worker 普通代理缓存只执行 HTTP 响应头里的缓存语义：
 
-- 不传缓存参数时，默认走 `cache=auto`，行为偏保守。
-- 想缓存时，在请求里显式传 `cache=prefer` 或 `cache=refresh`。
-- `cache_ttl` 传秒数时，用调用方指定的 TTL。
-- 不传 `cache_ttl` 时，会尝试从上游 `Cache-Control` 或 `Expires` 推导。
-- 如果 TTL 推导失败，普通 `mode=proxy` 会直接透传并跳过缓存写入。
+- 上游响应带 `Cache-Control: public, max-age=...` 或有效的 `Expires` 时，Worker 会写入 Cloudflare Cache API。
+- 上游响应带 `no-store`、`no-cache`、`private` 或无法推导 TTL 时，Worker 会直接透传并跳过缓存写入。
+- 客户端请求带 `Cache-Control: no-cache`、`Cache-Control: max-age=0` 或 `Pragma: no-cache` 时，Worker 会跳过旧缓存，重新拉取上游并在可缓存时更新缓存。
+- 普通代理不提供 `cache_ttl`、`cache_key` 这类私有缓存协议；缓存策略应该由响应头表达。
 - 返回头里会带 `X-Proxy-Cache: hit|miss|bypass|refresh|store-skipped`，方便排查是否真的命中了 Worker 缓存。
 
 ## 配置说明
@@ -317,7 +271,7 @@ https://你的-worker.你的账号.workers.dev/download?key=你的密码&url=htt
 - Worker 会尽量把访客请求头转发给目标站，也允许通过 `headers=` 指定额外请求头，但会过滤 `Connection`、`Transfer-Encoding` 等协议级请求头，并改写 `Host` 为目标站域名。
 - 默认只允许代理 `https` 地址。如果你把 `https` 改成 `false`，才会允许 `http` 地址。
 - Cloudflare Worker 有请求时长、响应大小、流量和滥用策略限制，大文件下载是否稳定取决于源站、网络和你的 Cloudflare 账户限制。
-- `mode=media` 会在首次请求时完整拉取文件，更适合短视频、中等体积媒体，不适合无限制地代理超大文件。
+- 当上游不支持 Range 时，Worker 会在首次 Range 请求中完整拉取文件，更适合短视频、中等体积媒体，不适合无限制地代理超大文件。
 
 ## 测试
 
