@@ -437,6 +437,39 @@ test("removes upstream browser security policy headers from rewritten pages", as
   }
 });
 
+test("removes upstream CSP meta tags from rewritten pages", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      `<!doctype html>
+      <meta http-equiv="Content-Security-Policy" content="default-src 'none'">
+      <meta content="default-src 'none'" http-equiv='Content-Security-Policy-Report-Only'>
+      <meta name="viewport" content="width=device-width">
+      <script src="/app.js"></script>`,
+      {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+        },
+      },
+    );
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/github.com?_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+
+    assert.doesNotMatch(html, /http-equiv=["']?Content-Security-Policy/i);
+    assert.doesNotMatch(html, /http-equiv=["']?Content-Security-Policy-Report-Only/i);
+    assert.match(html, /<meta name="viewport" content="width=device-width">/);
+    assert.match(response.headers.get("Content-Security-Policy"), /script-src 'self'/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("injects a runtime URL patch for dynamic browser requests", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>

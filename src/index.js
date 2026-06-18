@@ -778,8 +778,21 @@ function injectRuntimeScript(html, baseUrl, config, requestOptions) {
   return `${runtimeScript}${html}`;
 }
 
+function removeBrowserPolicyMetaTags(html) {
+  return html.replace(/<meta\b[^>]*>/gi, (tag) => {
+    const httpEquivMatch = /\bhttp-equiv\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i.exec(tag);
+    const httpEquiv = (httpEquivMatch?.[1] ?? httpEquivMatch?.[2] ?? httpEquivMatch?.[3] ?? "").toLowerCase();
+
+    if (httpEquiv === "content-security-policy" || httpEquiv === "content-security-policy-report-only") {
+      return "";
+    }
+
+    return tag;
+  });
+}
+
 function rewriteHtml(html, baseUrl, requestUrl, config, requestOptions) {
-  let rewrittenHtml = html.replace(
+  let rewrittenHtml = removeBrowserPolicyMetaTags(html).replace(
     /\b(href|src|action|poster|data)=("([^"]*)"|'([^']*)')/gi,
     (match, name, quotedValue, doubleValue, singleValue) => {
       const quote = quotedValue[0];
