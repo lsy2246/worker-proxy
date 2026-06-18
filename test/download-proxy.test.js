@@ -329,6 +329,35 @@ test("rewrites HTML resource links through the proxy path", async () => {
   }
 });
 
+test("removes upstream browser security policy headers from rewritten pages", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response('<link rel="stylesheet" href="/site.css">', {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+        "Content-Security-Policy": "default-src 'none'; style-src github.githubassets.com",
+        "Content-Security-Policy-Report-Only": "default-src 'none'",
+        "X-Frame-Options": "deny",
+        "Permissions-Policy": "geolocation=()",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/github.com?_key=secret"),
+      env,
+      {},
+    );
+
+    assert.equal(response.headers.get("Content-Security-Policy"), null);
+    assert.equal(response.headers.get("Content-Security-Policy-Report-Only"), null);
+    assert.equal(response.headers.get("X-Frame-Options"), null);
+    assert.equal(response.headers.get("Permissions-Policy"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("preserves explicit http targets when rewriting links", async () => {
   const configuredWorker = createWorker({ https: false });
   const originalFetch = globalThis.fetch;

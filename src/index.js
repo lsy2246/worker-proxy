@@ -54,6 +54,12 @@ const HOP_BY_HOP_HEADERS = new Set([
 const RESERVED_QUERY_PARAMS = new Set(["_key", "_url", "_headers", "_mode", "_disposition"]);
 const VALID_MODES = new Set(["page", "proxy", "range", "inspect"]);
 const VALID_DISPOSITIONS = new Set(["inline", "attachment"]);
+const BLOCKING_BROWSER_POLICY_HEADERS = [
+  "Content-Security-Policy",
+  "Content-Security-Policy-Report-Only",
+  "X-Frame-Options",
+  "Permissions-Policy",
+];
 const PROXY_CACHE_PATH = "/__proxy_cache__";
 const MAX_MANAGED_CACHE_TTL = 31536000;
 const DEFAULT_RANGE_CACHE_TTL = 86400;
@@ -373,6 +379,10 @@ function buildResponseHeaders(upstreamHeaders, config) {
     if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
       headers.set(name, value);
     }
+  }
+
+  for (const name of BLOCKING_BROWSER_POLICY_HEADERS) {
+    headers.delete(name);
   }
 
   if (config.disable_cache) {
