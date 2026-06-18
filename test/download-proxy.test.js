@@ -408,6 +408,10 @@ test("injects a runtime URL patch for dynamic browser requests", async () => {
     assert.match(html, /window\.fetch = function/);
     assert.match(html, /XMLHttpRequest\.prototype\.open = function/);
     assert.match(html, /alreadyProxied/);
+    assert.match(html, /document\.addEventListener\("submit"/);
+    assert.match(html, /HTMLFormElement\.prototype\.submit/);
+    assert.match(html, /history\.pushState = function/);
+    assert.match(html, /history\.replaceState = function/);
     assert.match(html, /searchParams\.set\("_key", proxyKey\)/);
   } finally {
     globalThis.fetch = originalFetch;

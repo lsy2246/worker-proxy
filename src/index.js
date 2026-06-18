@@ -655,6 +655,52 @@ function buildRuntimeScript(baseUrl, config, requestOptions) {
       return originalSendBeacon(proxifyUrl(url), data);
     };
   }
+
+  function proxifyFormAction(form) {
+    if (!form || !form.action) {
+      return;
+    }
+
+    form.action = proxifyUrl(form.action);
+  }
+
+  document.addEventListener("submit", (event) => {
+    proxifyFormAction(event.target);
+  }, true);
+
+  const originalFormSubmit = HTMLFormElement && HTMLFormElement.prototype.submit;
+  if (originalFormSubmit) {
+    HTMLFormElement.prototype.submit = function() {
+      proxifyFormAction(this);
+      return originalFormSubmit.call(this);
+    };
+  }
+
+  const originalPushState = history && history.pushState;
+  if (originalPushState) {
+    history.pushState = function(state, title, url) {
+      return originalPushState.call(this, state, title, url == null ? url : proxifyUrl(String(url)));
+    };
+  }
+
+  const originalReplaceState = history && history.replaceState;
+  if (originalReplaceState) {
+    history.replaceState = function(state, title, url) {
+      return originalReplaceState.call(this, state, title, url == null ? url : proxifyUrl(String(url)));
+    };
+  }
+
+  document.addEventListener("click", (event) => {
+    const link = event.target && event.target.closest && event.target.closest("a[href]");
+    if (!link || event.defaultPrevented || link.target || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+      return;
+    }
+
+    const proxiedHref = proxifyUrl(link.getAttribute("href"));
+    if (proxiedHref !== link.getAttribute("href")) {
+      link.href = proxiedHref;
+    }
+  }, true);
 })();
 </script>`;
 }
