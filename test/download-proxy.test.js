@@ -247,14 +247,15 @@ test("applies upstream request headers from the _headers query parameter", async
   }
 });
 
-test("strips client hint headers before forwarding upstream requests", async () => {
+test("forwards client hint headers for upstream device detection", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     assert.equal(url, "https://example.com/");
-    assert.equal(init.headers.get("Sec-CH-UA-Mobile"), null);
-    assert.equal(init.headers.get("Sec-CH-Viewport-Width"), null);
-    assert.equal(init.headers.get("Viewport-Width"), null);
-    assert.equal(init.headers.get("DPR"), null);
+    assert.equal(init.headers.get("Sec-CH-UA-Mobile"), "?0");
+    assert.equal(init.headers.get("Sec-CH-UA-Platform"), '"Windows"');
+    assert.equal(init.headers.get("Sec-CH-Viewport-Width"), "1440");
+    assert.equal(init.headers.get("Viewport-Width"), "1440");
+    assert.equal(init.headers.get("DPR"), "1");
     return new Response("ok");
   };
 
@@ -262,10 +263,11 @@ test("strips client hint headers before forwarding upstream requests", async () 
     const response = await worker.fetch(
       request("/api/file/example.com/?_key=secret", {
         headers: {
-          "Sec-CH-UA-Mobile": "?1",
-          "Sec-CH-Viewport-Width": "390",
-          "Viewport-Width": "390",
-          DPR: "3",
+          "Sec-CH-UA-Mobile": "?0",
+          "Sec-CH-UA-Platform": '"Windows"',
+          "Sec-CH-Viewport-Width": "1440",
+          "Viewport-Width": "1440",
+          DPR: "1",
         },
       }),
       env,
@@ -273,6 +275,71 @@ test("strips client hint headers before forwarding upstream requests", async () 
     );
 
     assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("recomputes sec-fetch-site for the target site instead of the proxy origin", async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({
+      url,
+      secFetchSite: init.headers.get("Sec-Fetch-Site"),
+    });
+    return new Response("ok");
+  };
+
+  try {
+    const sameOriginResponse = await worker.fetch(
+      request("/api/file/example.com/assets/app.js?_key=secret", {
+        headers: {
+          Referer: "https://proxy.example.test/api/file/example.com/page?_key=secret",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+      env,
+      {},
+    );
+    const sameSiteResponse = await worker.fetch(
+      request("/api/file/static.example.com/assets/app.js?_key=secret", {
+        headers: {
+          Referer: "https://proxy.example.test/api/file/www.example.com/page?_key=secret",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+      env,
+      {},
+    );
+    const crossSiteResponse = await worker.fetch(
+      request("/api/file/cdn.example.net/assets/app.js?_key=secret", {
+        headers: {
+          Referer: "https://proxy.example.test/api/file/example.com/page?_key=secret",
+          "Sec-Fetch-Site": "same-origin",
+        },
+      }),
+      env,
+      {},
+    );
+
+    assert.equal(sameOriginResponse.status, 200);
+    assert.equal(sameSiteResponse.status, 200);
+    assert.equal(crossSiteResponse.status, 200);
+    assert.deepEqual(calls, [
+      {
+        url: "https://example.com/assets/app.js",
+        secFetchSite: "same-origin",
+      },
+      {
+        url: "https://static.example.com/assets/app.js",
+        secFetchSite: "same-site",
+      },
+      {
+        url: "https://cdn.example.net/assets/app.js",
+        secFetchSite: "cross-site",
+      },
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -571,6 +638,7 @@ test("removes upstream browser security policy headers from rewritten pages", as
         "Permissions-Policy": "geolocation=()",
         "Accept-CH": "Sec-CH-UA-Mobile, Sec-CH-Viewport-Width",
         "Critical-CH": "Sec-CH-UA-Mobile",
+        "Delegate-CH": "Sec-CH-UA-Mobile https://assets.example.com",
         Vary: "Sec-CH-UA-Mobile, Accept-Encoding",
       },
     });
@@ -586,9 +654,10 @@ test("removes upstream browser security policy headers from rewritten pages", as
     assert.equal(response.headers.get("Content-Security-Policy-Report-Only"), null);
     assert.equal(response.headers.get("X-Frame-Options"), null);
     assert.equal(response.headers.get("Permissions-Policy"), null);
-    assert.equal(response.headers.get("Accept-CH"), null);
-    assert.equal(response.headers.get("Critical-CH"), null);
-    assert.equal(response.headers.get("Vary"), "Accept-Encoding");
+    assert.equal(response.headers.get("Accept-CH"), "Sec-CH-UA-Mobile, Sec-CH-Viewport-Width");
+    assert.equal(response.headers.get("Critical-CH"), "Sec-CH-UA-Mobile");
+    assert.equal(response.headers.get("Delegate-CH"), "Sec-CH-UA-Mobile https://assets.example.com");
+    assert.equal(response.headers.get("Vary"), "Sec-CH-UA-Mobile, Accept-Encoding");
     assert.match(response.headers.get("Cache-Control"), /no-transform/);
   } finally {
     globalThis.fetch = originalFetch;
@@ -884,6 +953,56 @@ test("rewrites CSS url and import references through the proxy path", async () =
     assert.match(css, /@import "\/api\/file\/example.com\/base.css\?_key=secret"/);
     assert.match(css, /url\("\/api\/file\/example.com\/img\/bg.png\?_key=secret"\)/);
     assert.match(css, /url\(data:image\/png;base64,abc\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rewrites JavaScript dynamic module and worker URLs through the proxy path", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://example.com/assets/app.js");
+    return new Response(
+      `
+        import helper from "./helper.js";
+        import("./lazy.js");
+        import('/chunks/search.js');
+        new Worker("/workers/search-worker.js", { type: "module" });
+        new Worker(new URL("./module-worker.js", import.meta.url), { type: "module" });
+        new SharedWorker('../workers/shared.js');
+        navigator.serviceWorker.register("/sw.js");
+        export { helper as renamed } from "../exports.js";
+        const inlineData = "data:text/javascript,export default 1";
+        const untouched = "/not-a-module.js";
+      `,
+      {
+        headers: {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "Content-Length": "999",
+        },
+      },
+    );
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/assets/app.js?_key=secret"),
+      env,
+      {},
+    );
+    const js = await response.text();
+
+    assert.equal(response.headers.get("Content-Length"), null);
+    assert.match(js, /import helper from "\/api\/file\/example\.com\/assets\/helper\.js\?_key=secret"/);
+    assert.match(js, /import\("\/api\/file\/example\.com\/assets\/lazy\.js\?_key=secret"\)/);
+    assert.match(js, /import\('\/api\/file\/example\.com\/chunks\/search\.js\?_key=secret'\)/);
+    assert.match(js, /new Worker\("\/api\/file\/example\.com\/workers\/search-worker\.js\?_key=secret", \{ type: "module" \}\)/);
+    assert.match(js, /new Worker\(new URL\("\/api\/file\/example\.com\/assets\/module-worker\.js\?_key=secret", import\.meta\.url\), \{ type: "module" \}\)/);
+    assert.match(js, /new SharedWorker\('\/api\/file\/example\.com\/workers\/shared\.js\?_key=secret'\)/);
+    assert.match(js, /navigator\.serviceWorker\.register\("\/api\/file\/example\.com\/sw\.js\?_key=secret"\)/);
+    assert.match(js, /export \{ helper as renamed \} from "\/api\/file\/example\.com\/exports\.js\?_key=secret"/);
+    assert.match(js, /"data:text\/javascript,export default 1"/);
+    assert.match(js, /const untouched = "\/not-a-module\.js"/);
   } finally {
     globalThis.fetch = originalFetch;
   }

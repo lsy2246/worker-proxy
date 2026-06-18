@@ -55,35 +55,6 @@ const BLOCKING_BROWSER_POLICY_HEADERS = [
   "Content-Security-Policy-Report-Only",
   "X-Frame-Options",
   "Permissions-Policy",
-  "Accept-CH",
-  "Critical-CH",
-  "Delegate-CH",
-];
-const CLIENT_HINT_REQUEST_HEADERS = [
-  "DPR",
-  "Device-Memory",
-  "Downlink",
-  "ECT",
-  "RTT",
-  "Save-Data",
-  "Sec-CH-DPR",
-  "Sec-CH-Prefers-Color-Scheme",
-  "Sec-CH-Prefers-Reduced-Motion",
-  "Sec-CH-UA",
-  "Sec-CH-UA-Arch",
-  "Sec-CH-UA-Bitness",
-  "Sec-CH-UA-Full-Version",
-  "Sec-CH-UA-Full-Version-List",
-  "Sec-CH-UA-Mobile",
-  "Sec-CH-UA-Model",
-  "Sec-CH-UA-Platform",
-  "Sec-CH-UA-Platform-Version",
-  "Sec-CH-Viewport-Height",
-  "Sec-CH-Viewport-Width",
-  "Sec-CH-Width",
-  "Viewport-Height",
-  "Viewport-Width",
-  "Width",
 ];
 const PROXY_CACHE_PATH = "/__proxy_cache__";
 const LOCAL_COOKIE_PREFIX = "_pc_";
@@ -600,6 +571,40 @@ function resolveProxiedRefererTarget(request, config) {
   }
 }
 
+function isIpv4Address(hostname) {
+  return /^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname);
+}
+
+function getApproximateSite(hostname) {
+  const normalizedHost = hostname.toLowerCase().replace(/\.$/, "");
+  if (!normalizedHost || normalizedHost === "localhost" || isIpv4Address(normalizedHost) || normalizedHost.includes(":")) {
+    return normalizedHost;
+  }
+
+  const labels = normalizedHost.split(".").filter(Boolean);
+  if (labels.length <= 2) {
+    return normalizedHost;
+  }
+
+  return labels.slice(-2).join(".");
+}
+
+function getSecFetchSiteForTarget(refererTargetUrl, targetUrl) {
+  if (!refererTargetUrl) {
+    return null;
+  }
+
+  if (refererTargetUrl.origin === targetUrl.origin) {
+    return "same-origin";
+  }
+
+  if (refererTargetUrl.protocol === targetUrl.protocol && getApproximateSite(refererTargetUrl.hostname) === getApproximateSite(targetUrl.hostname)) {
+    return "same-site";
+  }
+
+  return "cross-site";
+}
+
 function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}, config = DEFAULT_CONFIG) {
   const headers = new Headers(request.headers);
   const refererTargetUrl = resolveProxiedRefererTarget(request, config);
@@ -613,10 +618,6 @@ function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}, config = DE
   headers.delete("cf-ray");
   headers.delete("x-forwarded-for");
   headers.delete("x-forwarded-proto");
-
-  for (const name of CLIENT_HINT_REQUEST_HEADERS) {
-    headers.delete(name);
-  }
 
   headers.delete("Cookie");
   headers.set("Host", targetUrl.host);
@@ -632,6 +633,11 @@ function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}, config = DE
 
   if (headers.has("Referer")) {
     headers.set("Referer", refererTargetUrl ? refererTargetUrl.href : targetUrl.href);
+  }
+
+  const secFetchSite = getSecFetchSiteForTarget(refererTargetUrl, targetUrl);
+  if (secFetchSite && headers.has("Sec-Fetch-Site")) {
+    headers.set("Sec-Fetch-Site", secFetchSite);
   }
 
   for (const [name, value] of Object.entries(extraHeaders)) {
@@ -734,7 +740,7 @@ function normalizeVaryHeader(headers) {
   const keptValues = vary
     .split(",")
     .map((value) => value.trim())
-    .filter((value) => value && !CLIENT_HINT_REQUEST_HEADERS.some((name) => name.toLowerCase() === value.toLowerCase()));
+    .filter(Boolean);
 
   if (keptValues.length === 0) {
     headers.delete("Vary");
@@ -783,6 +789,16 @@ function isHtmlResponse(headers) {
 function isCssResponse(headers) {
   const contentType = (headers.get("Content-Type") || "").toLowerCase();
   return contentType.includes("text/css");
+}
+
+function isJavaScriptResponse(headers) {
+  const contentType = (headers.get("Content-Type") || "").toLowerCase();
+  return (
+    contentType.includes("javascript") ||
+    contentType.includes("ecmascript") ||
+    contentType.includes("text/jscript") ||
+    contentType.includes("application/x-javascript")
+  );
 }
 
 function hasReplaceRules(replaceDict) {
@@ -1068,6 +1084,38 @@ function rewriteCss(css, baseUrl, requestUrl, config, requestOptions) {
   return rewrittenCss;
 }
 
+function rewriteJavaScriptStringUrl(quote, value, baseUrl, requestUrl, config, requestOptions) {
+  const rewrittenValue = rewriteUrlValue(value, baseUrl, requestUrl, config, requestOptions, false);
+  return `${quote}${rewrittenValue}${quote}`;
+}
+
+function rewriteJavaScript(js, baseUrl, requestUrl, config, requestOptions) {
+  let rewrittenJs = js.replace(
+    /\b(import\s*\(\s*)(["'])([^"']+)\2/g,
+    (match, prefix, quote, value) => `${prefix}${rewriteJavaScriptStringUrl(quote, value, baseUrl, requestUrl, config, requestOptions)}`,
+  );
+
+  rewrittenJs = rewrittenJs.replace(
+    /\b((?:import|export)\s+(?:[\s\S]*?\s+from\s*)?)(["'])([^"']+)\2/g,
+    (match, prefix, quote, value) => `${prefix}${rewriteJavaScriptStringUrl(quote, value, baseUrl, requestUrl, config, requestOptions)}`,
+  );
+
+  rewrittenJs = rewrittenJs.replace(
+    /\b(new\s+(?:Shared)?Worker\s*\(\s*)(["'])([^"']+)\2/g,
+    (match, prefix, quote, value) => `${prefix}${rewriteJavaScriptStringUrl(quote, value, baseUrl, requestUrl, config, requestOptions)}`,
+  );
+
+  rewrittenJs = rewrittenJs.replace(
+    /\b(new\s+URL\s*\(\s*)(["'])([^"']+)\2(\s*,\s*import\.meta\.url\s*\))/g,
+    (match, prefix, quote, value, suffix) => `${prefix}${rewriteJavaScriptStringUrl(quote, value, baseUrl, requestUrl, config, requestOptions)}${suffix}`,
+  );
+
+  return rewrittenJs.replace(
+    /\b((?:navigator\.)?serviceWorker\.register\s*\(\s*)(["'])([^"']+)\2/g,
+    (match, prefix, quote, value) => `${prefix}${rewriteJavaScriptStringUrl(quote, value, baseUrl, requestUrl, config, requestOptions)}`,
+  );
+}
+
 async function buildPageResponse(upstreamResponse, request, targetUrl, requestOptions, config) {
   const headers = buildResponseHeaders(upstreamResponse.headers, config, targetUrl);
 
@@ -1091,6 +1139,23 @@ async function buildPageResponse(upstreamResponse, request, targetUrl, requestOp
     headers.delete("Content-Length");
 
     return new Response(css, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers,
+    });
+  }
+
+  if (isJavaScriptResponse(upstreamResponse.headers)) {
+    let js = await upstreamResponse.text();
+    js = rewriteJavaScript(js, targetUrl, new URL(request.url), config, requestOptions);
+
+    if (hasReplaceRules(config.replace_dict)) {
+      js = replaceText(js, config.replace_dict);
+    }
+
+    headers.delete("Content-Length");
+
+    return new Response(js, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
       headers,
