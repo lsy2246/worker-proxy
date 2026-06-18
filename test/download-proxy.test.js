@@ -346,6 +346,60 @@ test("rewrites HTML resource links through the proxy path", async () => {
   }
 });
 
+test("rewrites upstream redirects through the proxy path", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, "https://example.com/start");
+    assert.equal(init.redirect, "manual");
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: "https://www.example.com/final?x=1",
+      },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/start?_key=secret"),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 302);
+    assert.equal(response.headers.get("Location"), "/api/file/www.example.com/final?x=1&_key=secret");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not duplicate proxy paths embedded in upstream redirects", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(null, {
+      status: 302,
+      headers: {
+        Location: "https://www.example.com/?utm=https%3A%2F%2Fproxy.example.test%2Fapi%2Ffile%2Fexample.com%2Fwatch%3Fv%3D1",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/watch?v=1&_key=secret"),
+      env,
+      {},
+    );
+
+    assert.equal(
+      response.headers.get("Location"),
+      "/api/file/www.example.com/?utm=https%3A%2F%2Fproxy.example.test%2Fapi%2Ffile%2Fexample.com%2Fwatch%3Fv%3D1&_key=secret",
+    );
+    assert.doesNotMatch(response.headers.get("Location"), /\/api\/file\/example\.com\/api\/file\//);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("removes upstream browser security policy headers from rewritten pages", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>

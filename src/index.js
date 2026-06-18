@@ -468,6 +468,34 @@ function buildResponseHeaders(upstreamHeaders, config) {
   return headers;
 }
 
+function isRedirectStatus(status) {
+  return status >= 300 && status < 400;
+}
+
+function buildUpstreamRedirectResponse(upstreamResponse, request, targetUrl, requestOptions, config) {
+  const headers = buildResponseHeaders(upstreamResponse.headers, config);
+  const location = upstreamResponse.headers.get("Location");
+
+  if (location) {
+    try {
+      const redirectTarget = new URL(location, targetUrl.href);
+      if (redirectTarget.protocol === "http:" || redirectTarget.protocol === "https:") {
+        headers.set("Location", buildProxyUrl(redirectTarget, new URL(request.url), config, requestOptions));
+      }
+    } catch {
+      headers.set("Location", location);
+    }
+  }
+
+  headers.delete("Content-Length");
+
+  return new Response(null, {
+    status: upstreamResponse.status,
+    statusText: upstreamResponse.statusText,
+    headers,
+  });
+}
+
 function normalizeVaryHeader(headers) {
   const vary = headers.get("Vary");
   if (!vary) {
@@ -1165,7 +1193,7 @@ async function handleProxy(request, targetUrl, extraHeaders, requestOptions, con
   const fetchInit = {
     method: request.method,
     headers: buildUpstreamHeaders(request, targetUrl, extraHeaders),
-    redirect: "follow",
+    redirect: "manual",
   };
 
   if (request.method !== "GET" && request.method !== "HEAD") {
@@ -1173,6 +1201,17 @@ async function handleProxy(request, targetUrl, extraHeaders, requestOptions, con
   }
 
   const upstreamResponse = await fetch(targetUrl.href, fetchInit);
+  if (isRedirectStatus(upstreamResponse.status)) {
+    return finalizeResponse(
+      buildUpstreamRedirectResponse(upstreamResponse, request, targetUrl, requestOptions, config),
+      request.method,
+      requestOptions.disposition,
+      {
+        "X-Proxy-Cache": "bypass",
+      },
+    );
+  }
+
   const proxyResponse = await buildPageResponse(upstreamResponse, request, targetUrl, requestOptions, config);
 
   if (!managedCacheEnabled || !proxyResponse.ok || !cache || !cacheRequest) {
