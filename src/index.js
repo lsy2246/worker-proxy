@@ -297,6 +297,37 @@ function buildSameOriginRedirectLocation(request) {
   return `${url.pathname}${url.search}`;
 }
 
+function buildQueryProxyPathRecoveredRequest(request, config) {
+  const requestUrl = new URL(request.url);
+
+  for (const value of requestUrl.searchParams.values()) {
+    if (!value || !matchesProxyPath(value, config.proxy_path)) {
+      continue;
+    }
+
+    const proxyUrl = new URL(requestUrl.origin);
+    proxyUrl.pathname = value;
+    const { targetUrl, error } = parseTargetUrl(proxyUrl, config);
+    if (error) {
+      continue;
+    }
+
+    const recoveredTargetUrl = new URL(`${requestUrl.pathname}${requestUrl.search}`, targetUrl.origin);
+    const recoveredUrl = new URL(requestUrl.origin);
+    const targetPath =
+      recoveredTargetUrl.protocol === "https:"
+        ? `${recoveredTargetUrl.host}${recoveredTargetUrl.pathname}`
+        : `${recoveredTargetUrl.protocol}//${recoveredTargetUrl.host}${recoveredTargetUrl.pathname}`;
+
+    recoveredUrl.pathname = `${config.proxy_path}/${targetPath}`;
+    recoveredUrl.search = recoveredTargetUrl.search;
+
+    return new Request(recoveredUrl.href, request);
+  }
+
+  return null;
+}
+
 function parseUpstreamHeaders(value) {
   if (!value) {
     return { headers: {} };
@@ -997,6 +1028,24 @@ function buildRuntimeScript(baseUrl, config, requestOptions) {
     };
   }
 
+  const originalLocationAssign = location.assign && location.assign.bind(location);
+  if (originalLocationAssign) {
+    try {
+      location.assign = function(url) {
+        return originalLocationAssign(proxifyUrl(url));
+      };
+    } catch {}
+  }
+
+  const originalLocationReplace = location.replace && location.replace.bind(location);
+  if (originalLocationReplace) {
+    try {
+      location.replace = function(url) {
+        return originalLocationReplace(proxifyUrl(url));
+      };
+    } catch {}
+  }
+
   function proxifyFormAction(form) {
     if (!form || !form.action) {
       return;
@@ -1679,7 +1728,9 @@ export function createWorker(config = {}) {
       let proxyRequest = request;
 
       if (!matchesProxyPath(url.pathname, normalizedConfig.proxy_path)) {
-        proxyRequest = buildRefererRecoveredRequest(request, normalizedConfig);
+        proxyRequest =
+          buildRefererRecoveredRequest(request, normalizedConfig) ||
+          buildQueryProxyPathRecoveredRequest(request, normalizedConfig);
         if (proxyRequest && isTopLevelNavigationRequest(request)) {
           return redirectResponse(buildSameOriginRedirectLocation(proxyRequest));
         }

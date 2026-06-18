@@ -807,6 +807,74 @@ test("runtime treats same-origin non-proxy URLs as target-site navigations", asy
   }
 });
 
+test("runtime proxifies scripted same-origin navigations", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("<!doctype html><title>App</title>", {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/x.com?_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+    const scriptMatch = /<script data-worker-proxy-runtime>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(scriptMatch);
+
+    const assignedUrls = [];
+    const replacedUrls = [];
+    const sandbox = {
+      URL,
+      Request,
+      location: {
+        origin: "https://proxy.example.test",
+        href: "https://proxy.example.test/api/file/x.com?_key=secret",
+        assign(url) {
+          assignedUrls.push(url);
+        },
+        replace(url) {
+          replacedUrls.push(url);
+        },
+      },
+      window: {
+        fetch() {
+          return Promise.resolve(new Response("ok"));
+        },
+      },
+      XMLHttpRequest: function XMLHttpRequest() {},
+      navigator: {},
+      HTMLFormElement: function HTMLFormElement() {},
+      history: {},
+      document: {
+        addEventListener() {},
+      },
+    };
+    sandbox.XMLHttpRequest.prototype.open = function open() {};
+    sandbox.HTMLFormElement.prototype.submit = function submit() {};
+    sandbox.window.location = sandbox.location;
+
+    vm.runInNewContext(scriptMatch[1], sandbox);
+    sandbox.location.assign("/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login");
+    sandbox.location.replace("https://proxy.example.test/i/jf/onboarding/web?mode=login");
+
+    assert.equal(
+      assignedUrls[0],
+      "https://proxy.example.test/api/file/x.com/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login&_key=secret",
+    );
+    assert.equal(
+      replacedUrls[0],
+      "https://proxy.example.test/api/file/x.com/i/jf/onboarding/web?mode=login&_key=secret",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("runtime does not wrap already proxied path strings", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async () =>
@@ -1162,6 +1230,29 @@ test("redirects top-level same-origin navigations back to recovered proxy paths"
     request("/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login", {
       headers: {
         Referer: "https://proxy.example.test/api/file/x.com",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
+      },
+    }),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 302);
+  assert.equal(
+    response.headers.get("Location"),
+    "/api/file/x.com/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login",
+  );
+});
+
+test("redirects top-level navigations using embedded proxy path query values", async () => {
+  const configuredWorker = createWorker({
+    fallback_mode: "html",
+    fallback_html: "fallback",
+  });
+  const response = await configuredWorker.fetch(
+    request("/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login", {
+      headers: {
         "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-Dest": "document",
       },
