@@ -582,8 +582,7 @@ test("removes upstream browser security policy headers from rewritten pages", as
       {},
     );
 
-    assert.match(response.headers.get("Content-Security-Policy"), /script-src 'self'/);
-    assert.doesNotMatch(response.headers.get("Content-Security-Policy"), /github\.githubassets\.com/);
+    assert.equal(response.headers.get("Content-Security-Policy"), null);
     assert.equal(response.headers.get("Content-Security-Policy-Report-Only"), null);
     assert.equal(response.headers.get("X-Frame-Options"), null);
     assert.equal(response.headers.get("Permissions-Policy"), null);
@@ -623,7 +622,7 @@ test("removes upstream CSP meta tags from rewritten pages", async () => {
     assert.doesNotMatch(html, /http-equiv=["']?Content-Security-Policy/i);
     assert.doesNotMatch(html, /http-equiv=["']?Content-Security-Policy-Report-Only/i);
     assert.match(html, /<meta name="viewport" content="width=device-width">/);
-    assert.match(response.headers.get("Content-Security-Policy"), /script-src 'self'/);
+    assert.equal(response.headers.get("Content-Security-Policy"), null);
   } finally {
     globalThis.fetch = originalFetch;
   }

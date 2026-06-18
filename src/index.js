@@ -85,18 +85,6 @@ const CLIENT_HINT_REQUEST_HEADERS = [
   "Viewport-Width",
   "Width",
 ];
-const PROXY_PAGE_CSP = [
-  "default-src 'self' data: blob:",
-  "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data:",
-  "style-src 'self' 'unsafe-inline' data:",
-  "img-src * data: blob:",
-  "font-src 'self' data: blob:",
-  "connect-src * data: blob:",
-  "media-src * data: blob:",
-  "worker-src 'self' blob:",
-  "frame-src *",
-  "object-src 'none'",
-].join("; ");
 const PROXY_CACHE_PATH = "/__proxy_cache__";
 const LOCAL_COOKIE_PREFIX = "_pc_";
 const MAX_MANAGED_CACHE_TTL = 31536000;
@@ -766,7 +754,6 @@ function setNoTransformCacheControl(headers) {
 }
 
 function applyPageResponseHeaders(headers) {
-  headers.set("Content-Security-Policy", PROXY_PAGE_CSP);
   setNoTransformCacheControl(headers);
 }
 
