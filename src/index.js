@@ -98,6 +98,7 @@ const PROXY_PAGE_CSP = [
   "object-src 'none'",
 ].join("; ");
 const PROXY_CACHE_PATH = "/__proxy_cache__";
+const LOCAL_COOKIE_PREFIX = "_pc_";
 const MAX_MANAGED_CACHE_TTL = 31536000;
 const DEFAULT_RANGE_CACHE_TTL = 86400;
 
@@ -352,6 +353,213 @@ function parseUpstreamHeaders(value) {
   return { headers };
 }
 
+function encodeBase64Url(value) {
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function decodeBase64Url(value) {
+  const paddedValue = value.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(paddedValue);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new TextDecoder().decode(bytes);
+}
+
+function parseCookieHeader(value) {
+  const cookies = [];
+
+  for (const part of (value || "").split(";")) {
+    const trimmedPart = part.trim();
+    if (!trimmedPart) {
+      continue;
+    }
+
+    const separatorIndex = trimmedPart.indexOf("=");
+    if (separatorIndex <= 0) {
+      continue;
+    }
+
+    cookies.push({
+      name: trimmedPart.slice(0, separatorIndex).trim(),
+      value: trimmedPart.slice(separatorIndex + 1),
+    });
+  }
+
+  return cookies;
+}
+
+function splitSetCookieHeader(value) {
+  if (!value) {
+    return [];
+  }
+
+  return value.split(/,\s*(?=[^;,=\s]+=)/);
+}
+
+function getSetCookieHeaders(headers) {
+  if (typeof headers.getSetCookie === "function") {
+    return headers.getSetCookie();
+  }
+
+  return splitSetCookieHeader(headers.get("Set-Cookie"));
+}
+
+function parseSetCookieHeader(value) {
+  const parts = value.split(";");
+  const [nameValue, ...attributeParts] = parts;
+  const separatorIndex = nameValue.indexOf("=");
+
+  if (separatorIndex <= 0) {
+    return null;
+  }
+
+  const cookie = {
+    name: nameValue.slice(0, separatorIndex).trim(),
+    value: nameValue.slice(separatorIndex + 1),
+    path: "/",
+    domain: "",
+    expires: "",
+    maxAge: "",
+    secure: false,
+    httpOnly: false,
+    sameSite: "",
+  };
+
+  for (const part of attributeParts) {
+    const trimmedPart = part.trim();
+    const attributeSeparatorIndex = trimmedPart.indexOf("=");
+    const name = (attributeSeparatorIndex === -1 ? trimmedPart : trimmedPart.slice(0, attributeSeparatorIndex)).trim().toLowerCase();
+    const attributeValue = attributeSeparatorIndex === -1 ? "" : trimmedPart.slice(attributeSeparatorIndex + 1).trim();
+
+    if (name === "domain") {
+      cookie.domain = attributeValue.toLowerCase().replace(/^\./, "");
+    } else if (name === "path") {
+      cookie.path = attributeValue || "/";
+    } else if (name === "expires") {
+      cookie.expires = attributeValue;
+    } else if (name === "max-age") {
+      cookie.maxAge = attributeValue;
+    } else if (name === "secure") {
+      cookie.secure = true;
+    } else if (name === "httponly") {
+      cookie.httpOnly = true;
+    } else if (name === "samesite") {
+      cookie.sameSite = attributeValue;
+    }
+  }
+
+  return cookie;
+}
+
+function domainMatches(host, cookieDomain) {
+  return host === cookieDomain || host.endsWith(`.${cookieDomain}`);
+}
+
+function pathMatches(pathname, cookiePath) {
+  return pathname === cookiePath || pathname.startsWith(cookiePath.endsWith("/") ? cookiePath : `${cookiePath}/`);
+}
+
+function buildLocalCookieName(targetHost, cookieName) {
+  return `${LOCAL_COOKIE_PREFIX}${encodeBase64Url(`${targetHost}|${cookieName}`).slice(0, 80)}`;
+}
+
+function encodeLocalCookiePayload(payload) {
+  return encodeBase64Url(JSON.stringify(payload));
+}
+
+function decodeLocalCookiePayload(value) {
+  try {
+    const payload = JSON.parse(decodeBase64Url(value));
+    if (!payload || typeof payload !== "object") {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function buildUpstreamCookieHeader(request, targetUrl) {
+  const cookies = [];
+
+  for (const cookie of parseCookieHeader(request.headers.get("Cookie"))) {
+    if (!cookie.name.startsWith(LOCAL_COOKIE_PREFIX)) {
+      continue;
+    }
+
+    const payload = decodeLocalCookiePayload(cookie.value);
+    if (!payload || !payload.name || payload.value === undefined || !payload.host) {
+      continue;
+    }
+
+    const cookieDomain = String(payload.domain || payload.host).toLowerCase().replace(/^\./, "");
+    const cookiePath = String(payload.path || "/");
+
+    if (!domainMatches(targetUrl.hostname.toLowerCase(), cookieDomain) || !pathMatches(targetUrl.pathname || "/", cookiePath)) {
+      continue;
+    }
+
+    cookies.push(`${payload.name}=${payload.value}`);
+  }
+
+  return cookies.join("; ");
+}
+
+function appendLocalSetCookies(headers, upstreamHeaders, targetUrl, config) {
+  const setCookieHeaders = getSetCookieHeaders(upstreamHeaders);
+
+  headers.delete("Set-Cookie");
+
+  for (const setCookieValue of setCookieHeaders) {
+    const upstreamCookie = parseSetCookieHeader(setCookieValue);
+    if (!upstreamCookie) {
+      continue;
+    }
+
+    if (upstreamCookie.domain && !domainMatches(targetUrl.hostname.toLowerCase(), upstreamCookie.domain)) {
+      continue;
+    }
+
+    const payload = {
+      host: targetUrl.hostname.toLowerCase(),
+      domain: upstreamCookie.domain,
+      path: upstreamCookie.path,
+      name: upstreamCookie.name,
+      value: upstreamCookie.value,
+    };
+    const cookieParts = [
+      `${buildLocalCookieName(payload.host, payload.name)}=${encodeLocalCookiePayload(payload)}`,
+      `Path=${config.proxy_path}`,
+      "Secure",
+    ];
+
+    if (upstreamCookie.maxAge) {
+      cookieParts.push(`Max-Age=${upstreamCookie.maxAge}`);
+    } else if (upstreamCookie.expires) {
+      cookieParts.push(`Expires=${upstreamCookie.expires}`);
+    }
+
+    if (upstreamCookie.httpOnly) {
+      cookieParts.push("HttpOnly");
+    }
+
+    cookieParts.push(`SameSite=${upstreamCookie.sameSite || "Lax"}`);
+    headers.append("Set-Cookie", cookieParts.join("; "));
+  }
+}
+
 function parseRequestOptions(url) {
   const mode = (url.searchParams.get("_mode") || "page").trim().toLowerCase();
   const dispositionValue = url.searchParams.get("_disposition");
@@ -383,8 +591,30 @@ function buildPreflightHeaders(request) {
   return headers;
 }
 
-function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}) {
+function resolveProxiedRefererTarget(request, config) {
+  const requestUrl = new URL(request.url);
+  const refererValue = request.headers.get("Referer");
+
+  if (!refererValue) {
+    return null;
+  }
+
+  try {
+    const refererUrl = new URL(refererValue);
+    if (refererUrl.origin !== requestUrl.origin || !matchesProxyPath(refererUrl.pathname, config.proxy_path)) {
+      return null;
+    }
+
+    const { targetUrl } = parseTargetUrl(refererUrl, config);
+    return targetUrl || null;
+  } catch {
+    return null;
+  }
+}
+
+function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}, config = DEFAULT_CONFIG) {
   const headers = new Headers(request.headers);
+  const refererTargetUrl = resolveProxiedRefererTarget(request, config);
 
   for (const name of HOP_BY_HOP_HEADERS) {
     headers.delete(name);
@@ -400,14 +630,20 @@ function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}) {
     headers.delete(name);
   }
 
+  headers.delete("Cookie");
   headers.set("Host", targetUrl.host);
 
+  const upstreamCookieHeader = buildUpstreamCookieHeader(request, targetUrl);
+  if (upstreamCookieHeader) {
+    headers.set("Cookie", upstreamCookieHeader);
+  }
+
   if (headers.has("Origin")) {
-    headers.set("Origin", targetUrl.origin);
+    headers.set("Origin", refererTargetUrl ? refererTargetUrl.origin : targetUrl.origin);
   }
 
   if (headers.has("Referer")) {
-    headers.set("Referer", targetUrl.href);
+    headers.set("Referer", refererTargetUrl ? refererTargetUrl.href : targetUrl.href);
   }
 
   for (const [name, value] of Object.entries(extraHeaders)) {
@@ -446,11 +682,12 @@ function setContentDisposition(headers, disposition) {
   headers.set("Content-Disposition", `${disposition}; ${currentValue}`);
 }
 
-function buildResponseHeaders(upstreamHeaders, config) {
+function buildResponseHeaders(upstreamHeaders, config, targetUrl = null) {
   const headers = new Headers(CORS_HEADERS);
 
   for (const [name, value] of upstreamHeaders) {
-    if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) {
+    const lowerName = name.toLowerCase();
+    if (!HOP_BY_HOP_HEADERS.has(lowerName) && lowerName !== "set-cookie") {
       headers.set(name, value);
     }
   }
@@ -465,6 +702,10 @@ function buildResponseHeaders(upstreamHeaders, config) {
     headers.set("Cache-Control", "no-store");
   }
 
+  if (targetUrl) {
+    appendLocalSetCookies(headers, upstreamHeaders, targetUrl, config);
+  }
+
   return headers;
 }
 
@@ -473,7 +714,7 @@ function isRedirectStatus(status) {
 }
 
 function buildUpstreamRedirectResponse(upstreamResponse, request, targetUrl, requestOptions, config) {
-  const headers = buildResponseHeaders(upstreamResponse.headers, config);
+  const headers = buildResponseHeaders(upstreamResponse.headers, config, targetUrl);
   const location = upstreamResponse.headers.get("Location");
 
   if (location) {
@@ -841,7 +1082,7 @@ function rewriteCss(css, baseUrl, requestUrl, config, requestOptions) {
 }
 
 async function buildPageResponse(upstreamResponse, request, targetUrl, requestOptions, config) {
-  const headers = buildResponseHeaders(upstreamResponse.headers, config);
+  const headers = buildResponseHeaders(upstreamResponse.headers, config, targetUrl);
 
   if (isHtmlResponse(upstreamResponse.headers)) {
     let html = await upstreamResponse.text();
@@ -887,8 +1128,8 @@ async function buildPageResponse(upstreamResponse, request, targetUrl, requestOp
   });
 }
 
-function buildRangeResponseHeaders(upstreamHeaders, config, ttl = DEFAULT_RANGE_CACHE_TTL) {
-  const headers = buildResponseHeaders(upstreamHeaders, config);
+function buildRangeResponseHeaders(upstreamHeaders, config, ttl = DEFAULT_RANGE_CACHE_TTL, targetUrl = null) {
+  const headers = buildResponseHeaders(upstreamHeaders, config, targetUrl);
   headers.set("Accept-Ranges", "bytes");
 
   if (!config.disable_cache) {
@@ -961,9 +1202,9 @@ function buildRangeNotSatisfiableResponse(totalLength, disposition) {
   });
 }
 
-function buildBufferedRangeResponse(buffer, upstreamHeaders, request, config, disposition, ttl = DEFAULT_RANGE_CACHE_TTL) {
+function buildBufferedRangeResponse(buffer, upstreamHeaders, request, config, disposition, ttl = DEFAULT_RANGE_CACHE_TTL, targetUrl = null) {
   const totalLength = buffer.byteLength;
-  const headers = buildRangeResponseHeaders(upstreamHeaders, config, ttl);
+  const headers = buildRangeResponseHeaders(upstreamHeaders, config, ttl, targetUrl);
   const range = parseSingleRangeHeader(request.headers.get("Range"), totalLength);
 
   if (range.type === "invalid") {
@@ -1137,7 +1378,7 @@ async function handleRange(request, targetUrl, extraHeaders, requestOptions, con
     }
   }
 
-  const upstreamHeaders = buildUpstreamHeaders(request, targetUrl, extraHeaders);
+  const upstreamHeaders = buildUpstreamHeaders(request, targetUrl, extraHeaders, config);
   const upstreamResponse = await fetch(targetUrl.href, {
     method: "GET",
     headers: upstreamHeaders,
@@ -1149,7 +1390,7 @@ async function handleRange(request, targetUrl, extraHeaders, requestOptions, con
       new Response(upstreamResponse.body, {
         status: upstreamResponse.status,
         statusText: upstreamResponse.statusText,
-        headers: buildResponseHeaders(upstreamResponse.headers, config),
+        headers: buildResponseHeaders(upstreamResponse.headers, config, targetUrl),
       }),
       request.method,
       requestOptions.disposition,
@@ -1161,7 +1402,7 @@ async function handleRange(request, targetUrl, extraHeaders, requestOptions, con
   const resolvedTtl = resolveRangeCacheTtl(upstreamResponse.headers);
 
   if (managedCacheEnabled && cache && cacheRequest && upstreamResponse.ok) {
-    const headers = buildRangeResponseHeaders(upstreamResponse.headers, config, resolvedTtl);
+    const headers = buildRangeResponseHeaders(upstreamResponse.headers, config, resolvedTtl, targetUrl);
     headers.delete("Content-Range");
     headers.set("Content-Length", String(buffer.byteLength));
 
@@ -1181,6 +1422,7 @@ async function handleRange(request, targetUrl, extraHeaders, requestOptions, con
     config,
     requestOptions.disposition,
     resolvedTtl,
+    targetUrl,
   );
 
   return finalizeResponse(response, request.method, requestOptions.disposition, {
@@ -1209,7 +1451,7 @@ async function handleProxy(request, targetUrl, extraHeaders, requestOptions, con
 
   const fetchInit = {
     method: request.method,
-    headers: buildUpstreamHeaders(request, targetUrl, extraHeaders),
+    headers: buildUpstreamHeaders(request, targetUrl, extraHeaders, config),
     redirect: "manual",
   };
 
@@ -1251,8 +1493,8 @@ async function handleProxy(request, targetUrl, extraHeaders, requestOptions, con
   });
 }
 
-async function fetchUpstreamMetadata(request, targetUrl, extraHeaders) {
-  const headers = buildUpstreamHeaders(request, targetUrl, extraHeaders);
+async function fetchUpstreamMetadata(request, targetUrl, extraHeaders, config) {
+  const headers = buildUpstreamHeaders(request, targetUrl, extraHeaders, config);
   headers.delete("Range");
 
   return fetch(targetUrl.href, {
@@ -1267,7 +1509,7 @@ async function handleInspect(request, targetUrl, extraHeaders, requestOptions, c
   const cache = getDefaultCache();
   const cacheRequest = await buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders);
   const cachedResponse = cache ? await cache.match(cacheRequest) : null;
-  const upstreamResponse = await fetchUpstreamMetadata(request, targetUrl, extraHeaders);
+  const upstreamResponse = await fetchUpstreamMetadata(request, targetUrl, extraHeaders, config);
 
   return jsonResponse({
     mode: requestOptions.mode,

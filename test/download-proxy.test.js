@@ -278,6 +278,165 @@ test("strips client hint headers before forwarding upstream requests", async () 
   }
 });
 
+test("recovers upstream origin and referer from proxied page referers", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, "https://ev-h.phncdn.com/hls/video/seg-1.ts");
+    assert.equal(init.headers.get("Origin"), "https://cn.pornhub.com");
+    assert.equal(init.headers.get("Referer"), "https://cn.pornhub.com/view_video.php?viewkey=6623");
+    return new Response("ok", {
+      headers: {
+        "Content-Type": "video/MP2T",
+      },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/ev-h.phncdn.com/hls/video/seg-1.ts?_key=secret", {
+        headers: {
+          Origin: "https://proxy.example.test",
+          Referer: "https://proxy.example.test/api/file/cn.pornhub.com/view_video.php?viewkey=6623&_key=secret",
+        },
+      }),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("stores and forwards local upstream cookies scoped by host", async () => {
+  const originalFetch = globalThis.fetch;
+  let callCount = 0;
+  globalThis.fetch = async (url, init) => {
+    callCount += 1;
+
+    if (callCount === 1) {
+      assert.equal(url, "https://media.example.com/login");
+      assert.equal(init.headers.get("Cookie"), null);
+      return new Response("ok", {
+        headers: [
+          ["Content-Type", "text/plain"],
+          ["Set-Cookie", "sid=abc123; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=None"],
+          ["Set-Cookie", "theme=dark; Path=/player; Domain=.example.com"],
+        ],
+      });
+    }
+
+    assert.equal(url, "https://media.example.com/player/seg.ts");
+    assert.equal(init.headers.get("Cookie"), "sid=abc123; theme=dark");
+    return new Response("segment", {
+      headers: {
+        "Content-Type": "video/MP2T",
+      },
+    });
+  };
+
+  try {
+    const firstResponse = await worker.fetch(
+      request("/api/file/media.example.com/login?_key=secret", {
+        headers: {
+          Cookie: "proxy_session=leak",
+        },
+      }),
+      env,
+      {},
+    );
+    const storedCookies = firstResponse.headers.getSetCookie
+      ? firstResponse.headers.getSetCookie()
+      : firstResponse.headers.get("Set-Cookie").split(/,\s*(?=_pc_)/);
+
+    assert.equal(storedCookies.length, 2);
+    assert.match(storedCookies[0], /^_pc_/);
+    assert.match(storedCookies[0], /HttpOnly/);
+
+    const secondResponse = await worker.fetch(
+      request("/api/file/media.example.com/player/seg.ts?_key=secret", {
+        headers: {
+          Cookie: `proxy_session=leak; ${storedCookies.map((cookie) => cookie.split(";")[0]).join("; ")}`,
+        },
+      }),
+      env,
+      {},
+    );
+
+    assert.equal(secondResponse.status, 200);
+    assert.equal(callCount, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not forward local upstream cookies to unrelated hosts", async () => {
+  const originalFetch = globalThis.fetch;
+  let storedCookie = "";
+  let callCount = 0;
+  globalThis.fetch = async (url, init) => {
+    callCount += 1;
+
+    if (callCount === 1) {
+      return new Response("ok", {
+        headers: {
+          "Set-Cookie": "sid=abc123; Path=/",
+        },
+      });
+    }
+
+    assert.equal(url, "https://other.example.net/profile");
+    assert.equal(init.headers.get("Cookie"), null);
+    return new Response("ok");
+  };
+
+  try {
+    const firstResponse = await worker.fetch(
+      request("/api/file/media.example.com/login?_key=secret"),
+      env,
+      {},
+    );
+    storedCookie = firstResponse.headers.get("Set-Cookie").split(";")[0];
+
+    const secondResponse = await worker.fetch(
+      request("/api/file/other.example.net/profile?_key=secret", {
+        headers: {
+          Cookie: storedCookie,
+        },
+      }),
+      env,
+      {},
+    );
+
+    assert.equal(secondResponse.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("ignores upstream cookie domains that do not match the target host", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("ok", {
+      headers: {
+        "Set-Cookie": "sid=abc123; Domain=.other.example.net; Path=/",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/media.example.com/login?_key=secret"),
+      env,
+      {},
+    );
+
+    assert.equal(response.headers.get("Set-Cookie"), null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("rejects invalid _headers JSON", async () => {
   const response = await worker.fetch(
     request("/api/file/files.example.com/demo.zip?_key=secret&_headers=%7Bbad-json"),
@@ -738,7 +897,7 @@ test("forwards POST bodies for proxied forms", async () => {
     assert.equal(init.method, "POST");
     assert.equal(init.headers.get("Content-Type"), "application/x-www-form-urlencoded");
     assert.equal(init.headers.get("Origin"), "https://example.com");
-    assert.equal(init.headers.get("Referer"), "https://example.com/export?format=csv");
+    assert.equal(init.headers.get("Referer"), "https://example.com/form");
     assert.equal(await new Response(init.body).text(), "from=2026&to=2027");
     return new Response("a,b\n1,2\n", {
       headers: {
