@@ -178,25 +178,22 @@ test("uses explicit protocol from path targets", async () => {
   }
 });
 
-test("supports _url as a query target fallback", async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
-    assert.equal(url, "https://files.example.com/from-query.txt");
-    return new Response("ok");
-  };
+test("does not support target query fields as proxy targets", async () => {
+  const urlResponse = await worker.fetch(
+    request("/api/file?_key=secret&_url=https%3A%2F%2Ffiles.example.com%2Ffrom-query.txt"),
+    env,
+    {},
+  );
+  const targetResponse = await worker.fetch(
+    request("/api/file?_key=secret&_target=https%3A%2F%2Ffiles.example.com%2Ffrom-query.txt"),
+    env,
+    {},
+  );
 
-  try {
-    const response = await worker.fetch(
-      request("/api/file?_key=secret&_url=https%3A%2F%2Ffiles.example.com%2Ffrom-query.txt"),
-      env,
-      {},
-    );
-
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), "ok");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
+  assert.equal(urlResponse.status, 400);
+  assert.equal(await urlResponse.text(), "Missing target URL");
+  assert.equal(targetResponse.status, 400);
+  assert.equal(await targetResponse.text(), "Missing target URL");
 });
 
 test("does not treat target key mode or url parameters as proxy parameters", async () => {
@@ -413,6 +410,7 @@ test("injects a runtime URL patch for dynamic browser requests", async () => {
     assert.match(html, /HTMLFormElement\.prototype\.submit/);
     assert.doesNotMatch(html, /history\.pushState = function/);
     assert.doesNotMatch(html, /history\.replaceState = function/);
+    assert.doesNotMatch(html, /searchParams\.set\("_target"/);
     assert.match(html, /searchParams\.set\("_key", proxyKey\)/);
   } finally {
     globalThis.fetch = originalFetch;

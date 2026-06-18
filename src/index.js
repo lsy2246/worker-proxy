@@ -47,7 +47,7 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
-const RESERVED_QUERY_PARAMS = new Set(["_key", "_url", "_headers", "_mode", "_disposition"]);
+const RESERVED_QUERY_PARAMS = new Set(["_key", "_headers", "_mode", "_disposition"]);
 const VALID_MODES = new Set(["page", "proxy", "range", "inspect"]);
 const VALID_DISPOSITIONS = new Set(["inline", "attachment"]);
 const BLOCKING_BROWSER_POLICY_HEADERS = [
@@ -237,11 +237,6 @@ function resolveRawTarget(requestUrl, config) {
 
   if (pathSuffix) {
     return pathSuffix;
-  }
-
-  const queryTarget = requestUrl.searchParams.get("_url");
-  if (queryTarget) {
-    return queryTarget;
   }
 
   return null;
