@@ -5,9 +5,6 @@ const blocked_region = [];
 // 禁止访问的 IP。Cloudflare 会通过 cf-connecting-ip 请求头传入真实访客 IP。
 const blocked_ip_address = [];
 
-// 是否只允许 HTTPS 目标地址。true 表示 http:// 目标会被拒绝。
-const https = true;
-
 // 是否禁用缓存。true 会把响应头 Cache-Control 改成 no-store。
 const disable_cache = false;
 
@@ -30,7 +27,6 @@ const fallback_redirect_url = "https://b.u.cd";
 const DEFAULT_CONFIG = {
   blocked_region,
   blocked_ip_address,
-  https,
   disable_cache,
   replace_dict,
   proxy_path,
@@ -59,7 +55,48 @@ const BLOCKING_BROWSER_POLICY_HEADERS = [
   "Content-Security-Policy-Report-Only",
   "X-Frame-Options",
   "Permissions-Policy",
+  "Accept-CH",
+  "Critical-CH",
+  "Delegate-CH",
 ];
+const CLIENT_HINT_REQUEST_HEADERS = [
+  "DPR",
+  "Device-Memory",
+  "Downlink",
+  "ECT",
+  "RTT",
+  "Save-Data",
+  "Sec-CH-DPR",
+  "Sec-CH-Prefers-Color-Scheme",
+  "Sec-CH-Prefers-Reduced-Motion",
+  "Sec-CH-UA",
+  "Sec-CH-UA-Arch",
+  "Sec-CH-UA-Bitness",
+  "Sec-CH-UA-Full-Version",
+  "Sec-CH-UA-Full-Version-List",
+  "Sec-CH-UA-Mobile",
+  "Sec-CH-UA-Model",
+  "Sec-CH-UA-Platform",
+  "Sec-CH-UA-Platform-Version",
+  "Sec-CH-Viewport-Height",
+  "Sec-CH-Viewport-Width",
+  "Sec-CH-Width",
+  "Viewport-Height",
+  "Viewport-Width",
+  "Width",
+];
+const PROXY_PAGE_CSP = [
+  "default-src 'self' data: blob:",
+  "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data:",
+  "style-src 'self' 'unsafe-inline' data:",
+  "img-src * data: blob:",
+  "font-src 'self' data: blob:",
+  "connect-src * data: blob:",
+  "media-src * data: blob:",
+  "worker-src 'self' blob:",
+  "frame-src *",
+  "object-src 'none'",
+].join("; ");
 const PROXY_CACHE_PATH = "/__proxy_cache__";
 const MAX_MANAGED_CACHE_TTL = 31536000;
 const DEFAULT_RANGE_CACHE_TTL = 86400;
@@ -230,10 +267,6 @@ function parseTargetUrl(requestUrl, config) {
     return { error: "Only http and https URLs are allowed" };
   }
 
-  if (config.https && targetUrl.protocol !== "https:") {
-    return { error: "Only https URLs are allowed" };
-  }
-
   for (const [name, value] of requestUrl.searchParams) {
     if (!RESERVED_QUERY_PARAMS.has(name)) {
       targetUrl.searchParams.append(name, value);
@@ -326,6 +359,10 @@ function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}) {
   headers.delete("x-forwarded-for");
   headers.delete("x-forwarded-proto");
 
+  for (const name of CLIENT_HINT_REQUEST_HEADERS) {
+    headers.delete(name);
+  }
+
   headers.set("Host", targetUrl.host);
 
   if (headers.has("Origin")) {
@@ -385,11 +422,46 @@ function buildResponseHeaders(upstreamHeaders, config) {
     headers.delete(name);
   }
 
+  normalizeVaryHeader(headers);
+
   if (config.disable_cache) {
     headers.set("Cache-Control", "no-store");
   }
 
   return headers;
+}
+
+function normalizeVaryHeader(headers) {
+  const vary = headers.get("Vary");
+  if (!vary) {
+    return;
+  }
+
+  const keptValues = vary
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value && !CLIENT_HINT_REQUEST_HEADERS.some((name) => name.toLowerCase() === value.toLowerCase()));
+
+  if (keptValues.length === 0) {
+    headers.delete("Vary");
+    return;
+  }
+
+  headers.set("Vary", keptValues.join(", "));
+}
+
+function setNoTransformCacheControl(headers) {
+  const cacheControl = headers.get("Cache-Control") || "";
+  if (/\bno-transform\b/i.test(cacheControl)) {
+    return;
+  }
+
+  headers.set("Cache-Control", cacheControl ? `${cacheControl}, no-transform` : "no-transform");
+}
+
+function applyPageResponseHeaders(headers) {
+  headers.set("Content-Security-Policy", PROXY_PAGE_CSP);
+  setNoTransformCacheControl(headers);
 }
 
 function setManagedCacheControl(headers, ttl, config) {
@@ -509,6 +581,98 @@ function rewriteMetaRefresh(value, baseUrl, requestUrl, config, requestOptions) 
   });
 }
 
+function buildRuntimeScript(baseUrl, config, requestOptions) {
+  return `<script data-worker-proxy-runtime>
+(() => {
+  const proxyOrigin = location.origin;
+  const proxyPath = ${JSON.stringify(config.proxy_path)};
+  const baseTargetUrl = ${JSON.stringify(baseUrl.href)};
+  const proxyKey = ${JSON.stringify(requestOptions.key || "")};
+  const skipPattern = /^(?:#|mailto:|tel:|javascript:|data:|blob:|about:)/i;
+
+  function alreadyProxied(url) {
+    return url.origin === proxyOrigin && (
+      url.pathname === proxyPath ||
+      url.pathname.startsWith(proxyPath + "/")
+    );
+  }
+
+  function proxifyUrl(value) {
+    if (typeof value !== "string" || !value || skipPattern.test(value)) {
+      return value;
+    }
+
+    try {
+      const target = new URL(value, baseTargetUrl);
+      if (alreadyProxied(target)) {
+        return value;
+      }
+
+      if (target.protocol !== "http:" && target.protocol !== "https:") {
+        return value;
+      }
+
+      const proxied = new URL(proxyOrigin);
+      const targetPath = target.protocol === "https:"
+        ? target.host + target.pathname
+        : target.protocol + "//" + target.host + target.pathname;
+      proxied.pathname = proxyPath + "/" + targetPath;
+      proxied.search = target.search;
+      if (proxyKey) {
+        proxied.searchParams.set("_key", proxyKey);
+      }
+      return proxied.href;
+    } catch {
+      return value;
+    }
+  }
+
+  const originalFetch = window.fetch;
+  if (originalFetch) {
+    window.fetch = function(input, init) {
+      if (typeof input === "string") {
+        return originalFetch.call(this, proxifyUrl(input), init);
+      }
+
+      if (input instanceof Request) {
+        return originalFetch.call(this, new Request(proxifyUrl(input.url), input), init);
+      }
+
+      return originalFetch.call(this, input, init);
+    };
+  }
+
+  const originalOpen = XMLHttpRequest && XMLHttpRequest.prototype.open;
+  if (originalOpen) {
+    XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+      return originalOpen.call(this, method, proxifyUrl(url), ...rest);
+    };
+  }
+
+  const originalSendBeacon = navigator.sendBeacon && navigator.sendBeacon.bind(navigator);
+  if (originalSendBeacon) {
+    navigator.sendBeacon = function(url, data) {
+      return originalSendBeacon(proxifyUrl(url), data);
+    };
+  }
+})();
+</script>`;
+}
+
+function injectRuntimeScript(html, baseUrl, config, requestOptions) {
+  const runtimeScript = buildRuntimeScript(baseUrl, config, requestOptions);
+
+  if (/<head\b[^>]*>/i.test(html)) {
+    return html.replace(/<head\b[^>]*>/i, (match) => `${match}\n${runtimeScript}`);
+  }
+
+  if (/<html\b[^>]*>/i.test(html)) {
+    return html.replace(/<html\b[^>]*>/i, (match) => `${match}\n${runtimeScript}`);
+  }
+
+  return `${runtimeScript}${html}`;
+}
+
 function rewriteHtml(html, baseUrl, requestUrl, config, requestOptions) {
   let rewrittenHtml = html.replace(
     /\b(href|src|action|poster|data)=("([^"]*)"|'([^']*)')/gi,
@@ -564,7 +728,9 @@ async function buildPageResponse(upstreamResponse, request, targetUrl, requestOp
   if (isHtmlResponse(upstreamResponse.headers)) {
     let html = await upstreamResponse.text();
     html = rewriteHtml(html, targetUrl, new URL(request.url), config, requestOptions);
+    html = injectRuntimeScript(html, targetUrl, config, requestOptions);
     headers.delete("Content-Length");
+    applyPageResponseHeaders(headers);
 
     return new Response(html, {
       status: upstreamResponse.status,

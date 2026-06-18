@@ -157,7 +157,6 @@ test("defaults path targets without a protocol to https", async () => {
 });
 
 test("uses explicit protocol from path targets", async () => {
-  const configuredWorker = createWorker({ https: false });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     assert.equal(url, "http://files.example.com/demo.zip");
@@ -165,7 +164,7 @@ test("uses explicit protocol from path targets", async () => {
   };
 
   try {
-    const response = await configuredWorker.fetch(
+    const response = await worker.fetch(
       request("/api/file/http://files.example.com/demo.zip?_key=secret"),
       env,
       {},
@@ -176,17 +175,6 @@ test("uses explicit protocol from path targets", async () => {
   } finally {
     globalThis.fetch = originalFetch;
   }
-});
-
-test("rejects http targets when https-only mode is enabled", async () => {
-  const response = await worker.fetch(
-    request("/api/file/http://files.example.com/demo.zip?_key=secret"),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Only https URLs are allowed");
 });
 
 test("supports _url as a query target fallback", async () => {
@@ -251,6 +239,37 @@ test("applies upstream request headers from the _headers query parameter", async
   try {
     const response = await worker.fetch(
       request(`/api/file/img3.doubanio.com/view/photo/demo.webp?_key=secret&_headers=${extraHeaders}`),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("strips client hint headers before forwarding upstream requests", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, "https://example.com/");
+    assert.equal(init.headers.get("Sec-CH-UA-Mobile"), null);
+    assert.equal(init.headers.get("Sec-CH-Viewport-Width"), null);
+    assert.equal(init.headers.get("Viewport-Width"), null);
+    assert.equal(init.headers.get("DPR"), null);
+    return new Response("ok");
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/?_key=secret", {
+        headers: {
+          "Sec-CH-UA-Mobile": "?1",
+          "Sec-CH-Viewport-Width": "390",
+          "Viewport-Width": "390",
+          DPR: "3",
+        },
+      }),
       env,
       {},
     );
@@ -339,6 +358,9 @@ test("removes upstream browser security policy headers from rewritten pages", as
         "Content-Security-Policy-Report-Only": "default-src 'none'",
         "X-Frame-Options": "deny",
         "Permissions-Policy": "geolocation=()",
+        "Accept-CH": "Sec-CH-UA-Mobile, Sec-CH-Viewport-Width",
+        "Critical-CH": "Sec-CH-UA-Mobile",
+        Vary: "Sec-CH-UA-Mobile, Accept-Encoding",
       },
     });
 
@@ -349,17 +371,50 @@ test("removes upstream browser security policy headers from rewritten pages", as
       {},
     );
 
-    assert.equal(response.headers.get("Content-Security-Policy"), null);
+    assert.match(response.headers.get("Content-Security-Policy"), /script-src 'self'/);
+    assert.doesNotMatch(response.headers.get("Content-Security-Policy"), /github\.githubassets\.com/);
     assert.equal(response.headers.get("Content-Security-Policy-Report-Only"), null);
     assert.equal(response.headers.get("X-Frame-Options"), null);
     assert.equal(response.headers.get("Permissions-Policy"), null);
+    assert.equal(response.headers.get("Accept-CH"), null);
+    assert.equal(response.headers.get("Critical-CH"), null);
+    assert.equal(response.headers.get("Vary"), "Accept-Encoding");
+    assert.match(response.headers.get("Cache-Control"), /no-transform/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("injects a runtime URL patch for dynamic browser requests", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("<!doctype html><title>App</title>", {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/app/index.html?_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+
+    assert.match(html, /data-worker-proxy-runtime/);
+    assert.match(html, /const proxyPath = "\/api\/file"/);
+    assert.match(html, /const baseTargetUrl = "https:\/\/example.com\/app\/index.html"/);
+    assert.match(html, /window\.fetch = function/);
+    assert.match(html, /XMLHttpRequest\.prototype\.open = function/);
+    assert.match(html, /alreadyProxied/);
+    assert.match(html, /searchParams\.set\("_key", proxyKey\)/);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
 test("preserves explicit http targets when rewriting links", async () => {
-  const configuredWorker = createWorker({ https: false });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     assert.equal(url, "http://example.com/page");
@@ -369,7 +424,7 @@ test("preserves explicit http targets when rewriting links", async () => {
   };
 
   try {
-    const response = await configuredWorker.fetch(
+    const response = await worker.fetch(
       request("/api/file/http://example.com/page?_key=secret"),
       env,
       {},
