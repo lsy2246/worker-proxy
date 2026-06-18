@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import vm from "node:vm";
 
 import worker, { createWorker } from "../src/index.js";
 
@@ -413,6 +414,59 @@ test("injects a runtime URL patch for dynamic browser requests", async () => {
     assert.match(html, /history\.pushState = function/);
     assert.match(html, /history\.replaceState = function/);
     assert.match(html, /searchParams\.set\("_key", proxyKey\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime treats same-origin non-proxy URLs as target-site navigations", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("<!doctype html><title>App</title>", {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/app/index.html?_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+    const scriptMatch = /<script data-worker-proxy-runtime>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(scriptMatch);
+
+    let fetchedUrl = "";
+    const sandbox = {
+      URL,
+      Request,
+      location: new URL("https://proxy.example.test/api/file/example.com/app/index.html?_key=secret"),
+      window: {
+        fetch(input) {
+          fetchedUrl = typeof input === "string" ? input : input.url;
+          return Promise.resolve(new Response("ok"));
+        },
+      },
+      XMLHttpRequest: function XMLHttpRequest() {},
+      navigator: {},
+      HTMLFormElement: function HTMLFormElement() {},
+      history: {},
+      document: {
+        addEventListener() {},
+      },
+    };
+    sandbox.XMLHttpRequest.prototype.open = function open() {};
+    sandbox.HTMLFormElement.prototype.submit = function submit() {};
+
+    vm.runInNewContext(scriptMatch[1], sandbox);
+    await sandbox.window.fetch("https://proxy.example.test/search?q=lsy22&type=repositories");
+
+    assert.equal(
+      fetchedUrl,
+      "https://proxy.example.test/api/file/example.com/search?q=lsy22&type=repositories&_key=secret",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }

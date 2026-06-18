@@ -645,9 +645,13 @@ function buildRuntimeScript(baseUrl, config, requestOptions) {
     }
 
     try {
-      const target = new URL(value, baseTargetUrl);
+      let target = new URL(value, baseTargetUrl);
       if (alreadyProxied(target)) {
         return value;
+      }
+
+      if (target.origin === proxyOrigin) {
+        target = new URL(target.pathname + target.search + target.hash, baseTargetUrl);
       }
 
       if (target.protocol !== "http:" && target.protocol !== "https:") {
