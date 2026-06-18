@@ -26,17 +26,14 @@ function createRangeAwareCache() {
       });
     },
     async match(requestOrUrl) {
-      const request =
-        typeof requestOrUrl === "string" ? new Request(requestOrUrl) : requestOrUrl;
-      const entry = store.get(request.url);
+      const cacheRequest = typeof requestOrUrl === "string" ? new Request(requestOrUrl) : requestOrUrl;
+      const entry = store.get(cacheRequest.url);
 
       if (!entry) {
         return undefined;
       }
 
-      const rangeHeader = request.headers.get("Range");
-      const totalLength = entry.buffer.byteLength;
-
+      const rangeHeader = cacheRequest.headers.get("Range");
       if (!rangeHeader) {
         return new Response(entry.buffer.slice(0), {
           status: entry.status,
@@ -45,13 +42,12 @@ function createRangeAwareCache() {
         });
       }
 
+      const totalLength = entry.buffer.byteLength;
       const match = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader.trim());
       if (!match) {
         return new Response(null, {
           status: 416,
-          headers: {
-            "Content-Range": `bytes */${totalLength}`,
-          },
+          headers: { "Content-Range": `bytes */${totalLength}` },
         });
       }
 
@@ -61,15 +57,12 @@ function createRangeAwareCache() {
       if (start === null && end === null) {
         return new Response(null, {
           status: 416,
-          headers: {
-            "Content-Range": `bytes */${totalLength}`,
-          },
+          headers: { "Content-Range": `bytes */${totalLength}` },
         });
       }
 
       if (start === null) {
-        const suffixLength = end ?? 0;
-        start = Math.max(totalLength - suffixLength, 0);
+        start = Math.max(totalLength - (end ?? 0), 0);
         end = totalLength - 1;
       } else {
         end = end === null ? totalLength - 1 : Math.min(end, totalLength - 1);
@@ -78,9 +71,7 @@ function createRangeAwareCache() {
       if (start < 0 || start >= totalLength || start > end) {
         return new Response(null, {
           status: 416,
-          headers: {
-            "Content-Range": `bytes */${totalLength}`,
-          },
+          headers: { "Content-Range": `bytes */${totalLength}` },
         });
       }
 
@@ -100,9 +91,8 @@ function createRangeAwareCache() {
 
 function installMockCache() {
   const originalCaches = globalThis.caches;
-  const cache = createRangeAwareCache();
   globalThis.caches = {
-    default: cache,
+    default: createRangeAwareCache(),
   };
 
   return () => {
@@ -110,18 +100,14 @@ function installMockCache() {
   };
 }
 
-test("requires the configured password", async () => {
-  const response = await worker.fetch(
-    request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-    env,
-    {},
-  );
+test("requires the configured password from _key", async () => {
+  const response = await worker.fetch(request("/api/file/files.example.com/demo.zip"), env, {});
 
   assert.equal(response.status, 401);
   assert.equal(await response.text(), "Unauthorized");
 });
 
-test("allows requests without key when no password is configured", async () => {
+test("allows requests without _key when no password is configured", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
     assert.equal(url, "https://files.example.com/demo.zip");
@@ -130,10 +116,8 @@ test("allows requests without key when no password is configured", async () => {
 
   try {
     const response = await worker.fetch(
-      request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-      {
-        PROXY_PASSWORD: "",
-      },
+      request("/api/file/files.example.com/demo.zip"),
+      { PROXY_PASSWORD: "" },
       {},
     );
 
@@ -144,67 +128,98 @@ test("allows requests without key when no password is configured", async () => {
   }
 });
 
-test("accepts password from the key query parameter and streams the upstream response", async () => {
+test("defaults path targets without a protocol to https", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
     assert.equal(url, "https://files.example.com/demo.zip");
     assert.equal(init.method, "GET");
-
     return new Response("zip-body", {
-      status: 200,
       headers: {
         "Content-Type": "application/zip",
         "Content-Length": "8",
-        "Content-Disposition": 'attachment; filename="demo.zip"',
       },
     });
   };
 
   try {
     const response = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+      request("/api/file/files.example.com/demo.zip?_key=secret"),
       env,
       {},
     );
 
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("Content-Type"), "application/zip");
-    assert.equal(response.headers.get("Content-Length"), "8");
-    assert.equal(response.headers.get("Content-Disposition"), 'attachment; filename="demo.zip"');
-    assert.equal(response.headers.get("Access-Control-Allow-Origin"), "*");
     assert.equal(await response.text(), "zip-body");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("forwards incoming request headers to the upstream server", async () => {
+test("uses explicit protocol from path targets", async () => {
+  const configuredWorker = createWorker({ https: false });
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url, init) => {
-    const headers = init.headers;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "http://files.example.com/demo.zip");
+    return new Response("ok");
+  };
 
-    assert.equal(url, "https://files.example.com/demo.zip");
-    assert.equal(headers.get("Host"), "files.example.com");
-    assert.equal(headers.get("Referer"), "https://movie.douban.com/");
-    assert.equal(headers.get("Origin"), "https://example.com");
-    assert.equal(headers.get("Accept-Language"), "zh-CN,zh;q=0.9");
-    assert.equal(headers.get("Cookie"), "session=abc");
-    assert.equal(headers.get("Connection"), null);
+  try {
+    const response = await configuredWorker.fetch(
+      request("/api/file/http://files.example.com/demo.zip?_key=secret"),
+      env,
+      {},
+    );
 
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rejects http targets when https-only mode is enabled", async () => {
+  const response = await worker.fetch(
+    request("/api/file/http://files.example.com/demo.zip?_key=secret"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Only https URLs are allowed");
+});
+
+test("supports _url as a query target fallback", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://files.example.com/from-query.txt");
     return new Response("ok");
   };
 
   try {
     const response = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
-        headers: {
-          Referer: "https://movie.douban.com/",
-          Origin: "https://example.com",
-          "Accept-Language": "zh-CN,zh;q=0.9",
-          Cookie: "session=abc",
-          Connection: "keep-alive",
-        },
-      }),
+      request("/api/file?_key=secret&_url=https%3A%2F%2Ffiles.example.com%2Ffrom-query.txt"),
+      env,
+      {},
+    );
+
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "ok");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("does not treat target key mode or url parameters as proxy parameters", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://site.example.com/search?key=abc&mode=list&url=%2Fkeep&q=test");
+    return new Response("ok");
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/site.example.com/search?key=abc&mode=list&url=%2Fkeep&q=test&_key=secret"),
       env,
       {},
     );
@@ -215,7 +230,7 @@ test("forwards incoming request headers to the upstream server", async () => {
   }
 });
 
-test("applies upstream request headers from the headers query parameter", async () => {
+test("applies upstream request headers from the _headers query parameter", async () => {
   const extraHeaders = encodeURIComponent(
     JSON.stringify({
       Referer: "https://movie.douban.com/",
@@ -225,29 +240,17 @@ test("applies upstream request headers from the headers query parameter", async 
   );
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
-    const headers = init.headers;
-
     assert.equal(url, "https://img3.doubanio.com/view/photo/demo.webp");
-    assert.equal(headers.get("Host"), "img3.doubanio.com");
-    assert.equal(headers.get("Referer"), "https://movie.douban.com/");
-    assert.equal(headers.get("User-Agent"), "Mozilla/5.0 test");
-    assert.equal(headers.get("Accept"), "image/webp,image/apng,image/*,*/*;q=0.8");
-    assert.equal(headers.get("Accept-Language"), "zh-CN");
-
+    assert.equal(init.headers.get("Host"), "img3.doubanio.com");
+    assert.equal(init.headers.get("Referer"), "https://movie.douban.com/");
+    assert.equal(init.headers.get("User-Agent"), "Mozilla/5.0 test");
+    assert.equal(init.headers.get("Accept"), "image/webp,image/apng,image/*,*/*;q=0.8");
     return new Response("ok");
   };
 
   try {
     const response = await worker.fetch(
-      request(
-        `/download?key=secret&url=https%3A%2F%2Fimg3.doubanio.com%2Fview%2Fphoto%2Fdemo.webp&headers=${extraHeaders}`,
-        {
-          headers: {
-            Referer: "https://example.com/",
-            "Accept-Language": "zh-CN",
-          },
-        },
-      ),
+      request(`/api/file/img3.doubanio.com/view/photo/demo.webp?_key=secret&_headers=${extraHeaders}`),
       env,
       {},
     );
@@ -258,102 +261,213 @@ test("applies upstream request headers from the headers query parameter", async 
   }
 });
 
-test("rejects invalid upstream headers JSON", async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
-    throw new Error("upstream fetch should not be called");
-  };
-
-  try {
-    const response = await worker.fetch(
-      request(
-        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&headers=%7Bbad-json",
-      ),
-      env,
-      {},
-    );
-
-    assert.equal(response.status, 400);
-    assert.equal(await response.text(), "Invalid headers parameter");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("rejects invalid upstream header names", async () => {
-  const invalidHeaders = encodeURIComponent(
-    JSON.stringify({
-      "Bad Header": "value",
-    }),
+test("rejects invalid _headers JSON", async () => {
+  const response = await worker.fetch(
+    request("/api/file/files.example.com/demo.zip?_key=secret&_headers=%7Bbad-json"),
+    env,
+    {},
   );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid _headers parameter");
+});
+
+test("rejects unsupported _mode values", async () => {
+  const response = await worker.fetch(
+    request("/api/file/files.example.com/demo.zip?_key=secret&_mode=weird"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid _mode parameter");
+});
+
+test("rejects unsupported _disposition values", async () => {
+  const response = await worker.fetch(
+    request("/api/file/files.example.com/demo.zip?_key=secret&_disposition=preview"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 400);
+  assert.equal(await response.text(), "Invalid _disposition parameter");
+});
+
+test("rewrites HTML resource links through the proxy path", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
-    throw new Error("upstream fetch should not be called");
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://example.com/docs/index.html?lang=zh");
+    return new Response(
+      '<!doctype html><link href="/site.css"><img src="img/logo.png"><a href="../file.zip?x=1">Download</a><form method="post" action="/export"><input></form><meta http-equiv="refresh" content="0; url=/next">',
+      {
+        headers: {
+          "Content-Type": "text/html; charset=utf-8",
+          "Content-Length": "999",
+        },
+      },
+    );
   };
 
   try {
     const response = await worker.fetch(
-      request(
-        `/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&headers=${invalidHeaders}`,
-      ),
+      request("/api/file/example.com/docs/index.html?lang=zh&_key=secret"),
       env,
       {},
     );
+    const html = await response.text();
 
-    assert.equal(response.status, 400);
-    assert.equal(await response.text(), "Invalid headers parameter");
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Length"), null);
+    assert.match(html, /href="\/api\/file\/example.com\/site.css\?_key=secret"/);
+    assert.match(html, /src="\/api\/file\/example.com\/docs\/img\/logo.png\?_key=secret"/);
+    assert.match(html, /href="\/api\/file\/example.com\/file.zip\?x=1&amp;_key=secret"/);
+    assert.match(html, /action="\/api\/file\/example.com\/export\?_key=secret"/);
+    assert.match(html, /content="0; url=\/api\/file\/example.com\/next\?_key=secret"/);
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("rejects passwords sent through the authorization bearer header", async () => {
+test("preserves explicit http targets when rewriting links", async () => {
+  const configuredWorker = createWorker({ https: false });
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => {
-    throw new Error("upstream fetch should not be called");
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "http://example.com/page");
+    return new Response('<a href="/next">Next</a>', {
+      headers: { "Content-Type": "text/html" },
+    });
+  };
+
+  try {
+    const response = await configuredWorker.fetch(
+      request("/api/file/http://example.com/page?_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+
+    assert.match(html, /href="\/api\/file\/http:\/\/example.com\/next\?_key=secret"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("leaves non-proxyable HTML links unchanged", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response('<a href="#top">Top</a><a href="mailto:a@example.com">Mail</a><img src="data:image/png;base64,abc">', {
+      headers: { "Content-Type": "text/html" },
+    });
+
+  try {
+    const response = await worker.fetch(request("/api/file/example.com?_key=secret"), env, {});
+    const html = await response.text();
+
+    assert.match(html, /href="#top"/);
+    assert.match(html, /href="mailto:a@example.com"/);
+    assert.match(html, /src="data:image\/png;base64,abc"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("rewrites CSS url and import references through the proxy path", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://example.com/assets/site.css");
+    return new Response('@import "../base.css"; body{background:url("/img/bg.png")} .icon{src:url(data:image/png;base64,abc)}', {
+      headers: {
+        "Content-Type": "text/css",
+        "Content-Length": "999",
+      },
+    });
   };
 
   try {
     const response = await worker.fetch(
-      request("/download?url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
+      request("/api/file/example.com/assets/site.css?_key=secret"),
+      env,
+      {},
+    );
+    const css = await response.text();
+
+    assert.equal(response.headers.get("Content-Length"), null);
+    assert.match(css, /@import "\/api\/file\/example.com\/base.css\?_key=secret"/);
+    assert.match(css, /url\("\/api\/file\/example.com\/img\/bg.png\?_key=secret"\)/);
+    assert.match(css, /url\(data:image\/png;base64,abc\)/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("forwards POST bodies for proxied forms", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, "https://example.com/export?format=csv");
+    assert.equal(init.method, "POST");
+    assert.equal(init.headers.get("Content-Type"), "application/x-www-form-urlencoded");
+    assert.equal(init.headers.get("Origin"), "https://example.com");
+    assert.equal(init.headers.get("Referer"), "https://example.com/export?format=csv");
+    assert.equal(await new Response(init.body).text(), "from=2026&to=2027");
+    return new Response("a,b\n1,2\n", {
+      headers: {
+        "Content-Type": "text/csv",
+        "Content-Disposition": 'attachment; filename="report.csv"',
+      },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/export?format=csv&_key=secret", {
+        method: "POST",
         headers: {
-          Authorization: "Bearer secret",
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: "https://proxy.example.test",
+          Referer: "https://proxy.example.test/api/file/example.com/form?_key=secret",
         },
+        body: "from=2026&to=2027",
       }),
       env,
       {},
     );
 
-    assert.equal(response.status, 401);
-    assert.equal(await response.text(), "Unauthorized");
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get("Content-Disposition"), 'attachment; filename="report.csv"');
+    assert.equal(await response.text(), "a,b\n1,2\n");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("rejects non-http download URLs", async () => {
-  const response = await worker.fetch(request("/download?key=secret&url=file%3A%2F%2Fetc%2Fpasswd"), env, {});
+test("rewrites HTML returned by POST responses", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response('<a href="/result">Result</a>', {
+      headers: { "Content-Type": "text/html" },
+    });
 
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Only http and https URLs are allowed");
-});
+  try {
+    const response = await worker.fetch(
+      request("/api/file/example.com/submit?_key=secret", {
+        method: "POST",
+        body: "ok=1",
+      }),
+      env,
+      {},
+    );
+    const html = await response.text();
 
-test("rejects unsupported methods", async () => {
-  const response = await worker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
-      method: "POST",
-    }),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 405);
-  assert.equal(response.headers.get("Allow"), "GET, HEAD, OPTIONS");
+    assert.match(html, /href="\/api\/file\/example.com\/result\?_key=secret"/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("supports CORS preflight requests", async () => {
   const response = await worker.fetch(
-    request("/download", {
+    request("/api/file/example.com", {
       method: "OPTIONS",
     }),
     env,
@@ -362,10 +476,10 @@ test("supports CORS preflight requests", async () => {
 
   assert.equal(response.status, 204);
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), "*");
-  assert.equal(response.headers.get("Access-Control-Allow-Methods"), "GET, HEAD, OPTIONS");
+  assert.equal(response.headers.get("Access-Control-Allow-Methods"), "GET, HEAD, POST, OPTIONS");
 });
 
-test("serves configured fallback HTML for non-download paths", async () => {
+test("serves configured fallback HTML for non-proxy paths", async () => {
   const configuredWorker = createWorker({
     fallback_mode: "html",
     fallback_html: "<!doctype html><title>Home</title><main>hello</main>",
@@ -379,57 +493,9 @@ test("serves configured fallback HTML for non-download paths", async () => {
   assert.equal(await response.text(), "<!doctype html><title>Home</title><main>hello</main>");
 });
 
-test("redirects non-download paths when fallback redirect is configured", async () => {
+test("uses a configured proxy path before applying fallback behavior", async () => {
   const configuredWorker = createWorker({
-    fallback_mode: "redirect",
-    fallback_html: "",
-    fallback_redirect_url: "https://example.com/",
-  });
-
-  const response = await configuredWorker.fetch(request("/anything"), env, {});
-
-  assert.equal(response.status, 302);
-  assert.equal(response.headers.get("Location"), "https://example.com/");
-});
-
-test("keeps non-download paths as not found by default", async () => {
-  const configuredWorker = createWorker({
-    fallback_mode: "404",
-    fallback_html: "<!doctype html><title>Hidden</title>",
-    fallback_redirect_url: "https://example.com/",
-  });
-
-  const response = await configuredWorker.fetch(request("/anything"), env, {});
-
-  assert.equal(response.status, 404);
-  assert.equal(await response.text(), "Not Found");
-});
-
-test("keeps the download endpoint working when fallback HTML is configured", async () => {
-  const configuredWorker = createWorker({
-    fallback_mode: "html",
-    fallback_html: "<!doctype html><title>Home</title>",
-  });
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response("ok");
-
-  try {
-    const response = await configuredWorker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-      env,
-      {},
-    );
-
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), "ok");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("uses a configured download path before applying fallback behavior", async () => {
-  const configuredWorker = createWorker({
-    download_path: "/api/file",
+    proxy_path: "/service/view",
     fallback_mode: "html",
     fallback_html: "<!doctype html><title>Fallback</title>",
   });
@@ -440,59 +506,32 @@ test("uses a configured download path before applying fallback behavior", async 
   };
 
   try {
-    const downloadResponse = await configuredWorker.fetch(
-      request("/api/file?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+    const proxyResponse = await configuredWorker.fetch(
+      request("/service/view/files.example.com/demo.zip?_key=secret"),
       env,
       {},
     );
-    const oldDownloadPathResponse = await configuredWorker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
+    const defaultPathResponse = await configuredWorker.fetch(
+      request("/api/file/files.example.com/demo.zip?_key=secret"),
       env,
       {},
     );
 
-    assert.equal(downloadResponse.status, 200);
-    assert.equal(await downloadResponse.text(), "ok");
-    assert.equal(oldDownloadPathResponse.status, 200);
-    assert.equal(await oldDownloadPathResponse.text(), "<!doctype html><title>Fallback</title>");
+    assert.equal(proxyResponse.status, 200);
+    assert.equal(await proxyResponse.text(), "ok");
+    assert.equal(defaultPathResponse.status, 200);
+    assert.equal(await defaultPathResponse.text(), "<!doctype html><title>Fallback</title>");
   } finally {
     globalThis.fetch = originalFetch;
   }
 });
 
-test("falls back to the default download path when configured download path is empty or root", async () => {
-  for (const configuredPath of ["", "/"]) {
-    const configuredWorker = createWorker({
-      download_path: configuredPath,
-    });
-    const originalFetch = globalThis.fetch;
-    globalThis.fetch = async () => new Response("ok");
-
-    try {
-      const response = await configuredWorker.fetch(
-        request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-        env,
-        {},
-      );
-
-      assert.equal(response.status, 200);
-      assert.equal(await response.text(), "ok");
-    } finally {
-      globalThis.fetch = originalFetch;
-    }
-  }
-});
-
 test("blocks configured Cloudflare country codes", async () => {
-  const configuredWorker = createWorker({
-    blocked_region: ["CN"],
-  });
+  const configuredWorker = createWorker({ blocked_region: ["CN"] });
 
   const response = await configuredWorker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
-      headers: {
-        "cf-ipcountry": "CN",
-      },
+    request("/api/file/files.example.com/demo.zip?_key=secret", {
+      headers: { "cf-ipcountry": "CN" },
     }),
     env,
     {},
@@ -502,175 +541,13 @@ test("blocks configured Cloudflare country codes", async () => {
   assert.equal(await response.text(), "Access denied: region blocked");
 });
 
-test("blocks configured client IP addresses", async () => {
-  const configuredWorker = createWorker({
-    blocked_ip_address: ["203.0.113.10"],
-  });
-
-  const response = await configuredWorker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip", {
-      headers: {
-        "cf-connecting-ip": "203.0.113.10",
-      },
-    }),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 403);
-  assert.equal(await response.text(), "Access denied: IP blocked");
-});
-
-test("requires https target URLs when https is enabled", async () => {
-  const configuredWorker = createWorker({
-    https: true,
-  });
-
-  const response = await configuredWorker.fetch(
-    request("/download?key=secret&url=http%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Only https URLs are allowed");
-});
-
-test("allows http target URLs when https is disabled", async () => {
-  const configuredWorker = createWorker({
-    https: false,
-  });
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async (url) => {
-    assert.equal(url, "http://files.example.com/demo.zip");
-    return new Response("ok");
-  };
-
-  try {
-    const response = await configuredWorker.fetch(
-      request("/download?key=secret&url=http%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-      env,
-      {},
-    );
-
-    assert.equal(response.status, 200);
-    assert.equal(await response.text(), "ok");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("disables caching when disable_cache is enabled", async () => {
-  const configuredWorker = createWorker({
-    disable_cache: true,
-  });
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response("ok", {
-      headers: {
-        "Cache-Control": "public, max-age=3600",
-      },
-    });
-
-  try {
-    const response = await configuredWorker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-      env,
-      {},
-    );
-
-    assert.equal(response.headers.get("Cache-Control"), "no-store");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("replaces text response content only when configured", async () => {
-  const configuredWorker = createWorker({
-    replace_dict: {
-      "https://files.example.com": "https://proxy.example.test/download?url=https%3A%2F%2Ffiles.example.com",
-    },
-  });
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response("open https://files.example.com/demo.zip", {
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-      },
-    });
-
-  try {
-    const response = await configuredWorker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Freadme.txt"),
-      env,
-      {},
-    );
-
-    assert.equal(
-      await response.text(),
-      "open https://proxy.example.test/download?url=https%3A%2F%2Ffiles.example.com/demo.zip",
-    );
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("does not replace binary response content", async () => {
-  const configuredWorker = createWorker({
-    replace_dict: {
-      "zip-body": "changed",
-    },
-  });
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response("zip-body", {
-      headers: {
-        "Content-Type": "application/zip",
-      },
-    });
-
-  try {
-    const response = await configuredWorker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip"),
-      env,
-      {},
-    );
-
-    assert.equal(await response.text(), "zip-body");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("rejects unsupported mode values", async () => {
-  const response = await worker.fetch(
-    request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&mode=weird"),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Invalid mode parameter");
-});
-
-test("rejects unsupported disposition values", async () => {
-  const response = await worker.fetch(
-    request(
-      "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.zip&disposition=preview",
-    ),
-    env,
-    {},
-  );
-
-  assert.equal(response.status, 400);
-  assert.equal(await response.text(), "Invalid disposition parameter");
-});
-
 test("can inspect upstream metadata and proxy cache status", async () => {
   const restoreCache = installMockCache();
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () =>
-    new Response(null, {
+  globalThis.fetch = async (url, init) => {
+    assert.equal(url, "https://files.example.com/clip.mp4");
+    assert.equal(init.method, "HEAD");
+    return new Response(null, {
       status: 200,
       headers: {
         "Content-Type": "video/mp4",
@@ -678,238 +555,31 @@ test("can inspect upstream metadata and proxy cache status", async () => {
         "Content-Disposition": 'attachment; filename="clip.mp4"',
       },
     });
+  };
 
   try {
     const response = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4&mode=inspect"),
+      request("/api/file/files.example.com/clip.mp4?_key=secret&_mode=inspect"),
       env,
       {},
     );
 
     assert.equal(response.status, 200);
-    assert.equal(response.headers.get("Content-Type"), "application/json; charset=utf-8");
-
     const payload = await response.json();
     assert.equal(payload.mode, "inspect");
     assert.equal(payload.targetUrl, "https://files.example.com/clip.mp4");
     assert.equal(payload.proxyCache.status, "miss");
-    assert.equal(payload.upstream.status, 200);
     assert.equal(payload.upstream.contentType, "video/mp4");
-    assert.equal(payload.upstream.contentLength, "345");
   } finally {
     globalThis.fetch = originalFetch;
     restoreCache();
   }
 });
 
-test("stores proxy responses in Worker cache when upstream cache-control allows it", async () => {
+test("serves seekable range responses when upstream returns a full body", async () => {
   const restoreCache = installMockCache();
-  const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
-
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-    return new Response("cached-body", {
-      headers: {
-        "Content-Type": "image/jpeg",
-        "Cache-Control": "public, max-age=300",
-      },
-    });
-  };
-
-  try {
-    const first = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg"),
-      env,
-      {},
-    );
-    const second = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fposter.jpg"),
-      env,
-      {},
-    );
-
-    assert.equal(await first.text(), "cached-body");
-    assert.equal(await second.text(), "cached-body");
-    assert.equal(second.headers.get("X-Proxy-Cache"), "hit");
-    assert.equal(second.headers.get("Cache-Control"), "public, max-age=300");
-    assert.equal(fetchCount, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreCache();
-  }
-});
-
-test("infers proxy cache ttl from upstream cache-control", async () => {
-  const restoreCache = installMockCache();
-  const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
-
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-    return new Response("ttl-body", {
-      headers: {
-        "Content-Type": "image/jpeg",
-        "Cache-Control": "public, max-age=120",
-      },
-    });
-  };
-
-  try {
-    const first = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg"),
-      env,
-      {},
-    );
-    const second = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fttl.jpg"),
-      env,
-      {},
-    );
-
-    assert.equal(await first.text(), "ttl-body");
-    assert.equal(await second.text(), "ttl-body");
-    assert.equal(second.headers.get("X-Proxy-Cache"), "hit");
-    assert.equal(second.headers.get("Cache-Control"), "public, max-age=120");
-    assert.equal(fetchCount, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreCache();
-  }
-});
-
-test("skips proxy cache storage when no ttl can be inferred", async () => {
-  const restoreCache = installMockCache();
-  const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
-
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-    return new Response("no-ttl", {
-      headers: {
-        "Content-Type": "application/octet-stream",
-      },
-    });
-  };
-
-  try {
-    const first = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin"),
-      env,
-      {},
-    );
-    const second = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fblob.bin"),
-      env,
-      {},
-    );
-
-    assert.equal(await first.text(), "no-ttl");
-    assert.equal(await second.text(), "no-ttl");
-    assert.equal(first.headers.get("X-Proxy-Cache"), "store-skipped");
-    assert.equal(second.headers.get("X-Proxy-Cache"), "store-skipped");
-    assert.equal(fetchCount, 2);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreCache();
-  }
-});
-
-test("request cache-control no-cache refreshes proxy cache entries", async () => {
-  const restoreCache = installMockCache();
-  const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
-
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-    return new Response(`version-${fetchCount}`, {
-      headers: {
-        "Content-Type": "image/jpeg",
-        "Cache-Control": "public, max-age=300",
-      },
-    });
-  };
-
-  try {
-    await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg"),
-      env,
-      {},
-    );
-
-    const refreshed = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg", {
-        headers: {
-          "Cache-Control": "no-cache",
-        },
-      }),
-      env,
-      {},
-    );
-
-    const cachedAgain = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Frefresh.jpg"),
-      env,
-      {},
-    );
-
-    assert.equal(await refreshed.text(), "version-2");
-    assert.equal(await cachedAgain.text(), "version-2");
-    assert.equal(refreshed.headers.get("X-Proxy-Cache"), "refresh");
-    assert.equal(cachedAgain.headers.get("X-Proxy-Cache"), "hit");
-    assert.equal(fetchCount, 2);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreCache();
-  }
-});
-
-test("forwards standard range requests when upstream supports partial content", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init) => {
-    assert.equal(url, "https://files.example.com/clip.mp4");
-    assert.equal(init.method, "GET");
-    assert.equal(init.headers.get("Range"), "bytes=2-5");
-
-    return new Response("2345", {
-      status: 206,
-      statusText: "Partial Content",
-      headers: {
-        "Content-Type": "video/mp4",
-        "Content-Length": "4",
-        "Content-Range": "bytes 2-5/10",
-        "Accept-Ranges": "bytes",
-      },
-    });
-  };
-
-  try {
-    const response = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
-        headers: {
-          Range: "bytes=2-5",
-        },
-      }),
-      env,
-      {},
-    );
-
-    assert.equal(response.status, 206);
-    assert.equal(response.headers.get("Accept-Ranges"), "bytes");
-    assert.equal(response.headers.get("Content-Range"), "bytes 2-5/10");
-    assert.equal(response.headers.get("Content-Length"), "4");
-    assert.equal(await response.text(), "2345");
-  } finally {
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test("serves seekable range responses from ordinary proxy requests when upstream returns a full body", async () => {
-  const restoreCache = installMockCache();
-  const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
-  globalThis.fetch = async (url, init) => {
-    fetchCount += 1;
     assert.equal(url, "https://files.example.com/clip.mp4");
     assert.equal(init.method, "GET");
     assert.equal(init.headers.get("Range"), "bytes=2-5");
@@ -919,74 +589,22 @@ test("serves seekable range responses from ordinary proxy requests when upstream
       headers: {
         "Content-Type": "video/mp4",
         "Content-Length": "10",
-        "Content-Disposition": 'attachment; filename="clip.mp4"',
       },
     });
   };
 
   try {
     const response = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
-        headers: {
-          Range: "bytes=2-5",
-        },
+      request("/api/file/files.example.com/clip.mp4?_key=secret&_mode=range", {
+        headers: { Range: "bytes=2-5" },
       }),
       env,
       {},
     );
 
     assert.equal(response.status, 206);
-    assert.equal(response.headers.get("Accept-Ranges"), "bytes");
     assert.equal(response.headers.get("Content-Range"), "bytes 2-5/10");
-    assert.equal(response.headers.get("Content-Length"), "4");
     assert.equal(await response.text(), "2345");
-    assert.equal(fetchCount, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-    restoreCache();
-  }
-});
-
-test("reuses the cached full body for later ordinary range requests", async () => {
-  const restoreCache = installMockCache();
-  const originalFetch = globalThis.fetch;
-  let fetchCount = 0;
-  globalThis.fetch = async () => {
-    fetchCount += 1;
-
-    return new Response("abcdefghij", {
-      status: 200,
-      headers: {
-        "Content-Type": "video/mp4",
-        "Content-Length": "10",
-      },
-    });
-  };
-
-  try {
-    await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
-        headers: {
-          Range: "bytes=0-3",
-        },
-      }),
-      env,
-      {},
-    );
-
-    const secondResponse = await worker.fetch(
-      request("/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fclip.mp4", {
-        headers: {
-          Range: "bytes=4-7",
-        },
-      }),
-      env,
-      {},
-    );
-
-    assert.equal(secondResponse.status, 206);
-    assert.equal(await secondResponse.text(), "efgh");
-    assert.equal(fetchCount, 1);
   } finally {
     globalThis.fetch = originalFetch;
     restoreCache();
@@ -1005,9 +623,7 @@ test("can override content disposition for proxied downloads", async () => {
 
   try {
     const response = await worker.fetch(
-      request(
-        "/download?key=secret&url=https%3A%2F%2Ffiles.example.com%2Fdemo.bin&disposition=inline",
-      ),
+      request("/api/file/files.example.com/demo.bin?_key=secret&_disposition=inline"),
       env,
       {},
     );

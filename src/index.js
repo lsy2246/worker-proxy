@@ -5,7 +5,7 @@ const blocked_region = [];
 // 禁止访问的 IP。Cloudflare 会通过 cf-connecting-ip 请求头传入真实访客 IP。
 const blocked_ip_address = [];
 
-// 是否只允许 HTTPS 下载地址。true 表示 http:// 下载链接会被拒绝。
+// 是否只允许 HTTPS 目标地址。true 表示 http:// 目标会被拒绝。
 const https = true;
 
 // 是否禁用缓存。true 会把响应头 Cache-Control 改成 no-store。
@@ -14,8 +14,8 @@ const disable_cache = false;
 // 文本内容替换规则。只会处理文本响应，不会改 zip、exe、mp4、jpg 等二进制文件。
 const replace_dict = {};
 
-// 下载接口路径。留空或填写 "/" 时，默认使用 /download。
-const download_path = "/download";
+// 代理入口路径。建议改成不像代理服务的伪装路径，例如 /api/file、/assets/data。
+const proxy_path = "/api/file";
 
 // 其他路径处理方式：可选 "404"、"html"、"redirect"。
 const fallback_mode = "redirect";
@@ -33,13 +33,13 @@ const DEFAULT_CONFIG = {
   https,
   disable_cache,
   replace_dict,
-  download_path,
+  proxy_path,
   fallback_mode,
   fallback_html,
   fallback_redirect_url,
 };
 
-const ALLOWED_METHODS = ["GET", "HEAD", "OPTIONS"];
+const ALLOWED_METHODS = ["GET", "HEAD", "POST", "OPTIONS"];
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -51,18 +51,19 @@ const HOP_BY_HOP_HEADERS = new Set([
   "upgrade",
 ]);
 
+const RESERVED_QUERY_PARAMS = new Set(["_key", "_url", "_headers", "_mode", "_disposition"]);
+const VALID_MODES = new Set(["page", "proxy", "range", "inspect"]);
+const VALID_DISPOSITIONS = new Set(["inline", "attachment"]);
+const PROXY_CACHE_PATH = "/__proxy_cache__";
+const MAX_MANAGED_CACHE_TTL = 31536000;
+const DEFAULT_RANGE_CACHE_TTL = 86400;
+
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": ALLOWED_METHODS.join(", "),
   "Access-Control-Allow-Headers": "*",
   "Access-Control-Expose-Headers": "Content-Disposition, Content-Length, Content-Range, Content-Type, Accept-Ranges",
 };
-
-const VALID_MODES = new Set(["proxy", "inspect"]);
-const VALID_DISPOSITIONS = new Set(["inline", "attachment"]);
-const PROXY_CACHE_PATH = "/__proxy_cache__";
-const MAX_MANAGED_CACHE_TTL = 31536000;
-const DEFAULT_RANGE_CACHE_TTL = 86400;
 
 function textResponse(message, status, extraHeaders = {}) {
   return new Response(message, {
@@ -108,16 +109,6 @@ function redirectResponse(url) {
   });
 }
 
-function isAuthorized(url, env) {
-  const password = (env.PROXY_PASSWORD || "").trim();
-
-  if (!password) {
-    return true;
-  }
-
-  return url.searchParams.get("key") === password;
-}
-
 function normalizeConfig(config = {}) {
   return {
     ...DEFAULT_CONFIG,
@@ -125,8 +116,8 @@ function normalizeConfig(config = {}) {
     blocked_region: config.blocked_region || DEFAULT_CONFIG.blocked_region,
     blocked_ip_address: config.blocked_ip_address || DEFAULT_CONFIG.blocked_ip_address,
     replace_dict: config.replace_dict || DEFAULT_CONFIG.replace_dict,
-    download_path: normalizeDownloadPath(
-      config.download_path === undefined ? DEFAULT_CONFIG.download_path : config.download_path,
+    proxy_path: normalizeProxyPath(
+      config.proxy_path === undefined ? DEFAULT_CONFIG.proxy_path : config.proxy_path,
     ),
     fallback_mode: config.fallback_mode || DEFAULT_CONFIG.fallback_mode,
     fallback_html: config.fallback_html === undefined ? DEFAULT_CONFIG.fallback_html : config.fallback_html,
@@ -137,12 +128,15 @@ function normalizeConfig(config = {}) {
   };
 }
 
-function normalizeDownloadPath(path) {
+function normalizeProxyPath(path) {
   if (!path || path === "/") {
-    return "/download";
+    return DEFAULT_CONFIG.proxy_path;
   }
 
-  return path.startsWith("/") ? path : `/${path}`;
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return normalizedPath.endsWith("/") && normalizedPath.length > 1
+    ? normalizedPath.slice(0, -1)
+    : normalizedPath;
 }
 
 function handleFallback(config) {
@@ -155,6 +149,28 @@ function handleFallback(config) {
   }
 
   return textResponse("Not Found", 404);
+}
+
+function matchesProxyPath(pathname, proxyPath) {
+  return pathname === proxyPath || pathname.startsWith(`${proxyPath}/`);
+}
+
+function getProxyPathSuffix(pathname, proxyPath) {
+  if (pathname === proxyPath) {
+    return "";
+  }
+
+  return pathname.slice(proxyPath.length + 1);
+}
+
+function isAuthorized(url, env) {
+  const password = (env.PROXY_PASSWORD || "").trim();
+
+  if (!password) {
+    return true;
+  }
+
+  return url.searchParams.get("_key") === password;
 }
 
 function isBlockedRequest(request, config) {
@@ -173,16 +189,35 @@ function isBlockedRequest(request, config) {
   return null;
 }
 
-function parseDownloadUrl(value, config) {
-  if (!value) {
-    return { error: "Missing url parameter" };
+function resolveRawTarget(requestUrl, config) {
+  const pathSuffix = getProxyPathSuffix(requestUrl.pathname, config.proxy_path);
+
+  if (pathSuffix) {
+    return pathSuffix;
   }
 
+  const queryTarget = requestUrl.searchParams.get("_url");
+  if (queryTarget) {
+    return queryTarget;
+  }
+
+  return null;
+}
+
+function parseTargetUrl(requestUrl, config) {
+  const rawTarget = resolveRawTarget(requestUrl, config);
+
+  if (!rawTarget) {
+    return { error: "Missing target URL" };
+  }
+
+  const targetValue = /^https?:\/\//i.test(rawTarget) ? rawTarget : `https://${rawTarget}`;
   let targetUrl;
+
   try {
-    targetUrl = new URL(value);
+    targetUrl = new URL(targetValue);
   } catch {
-    return { error: "Invalid url parameter" };
+    return { error: "Invalid target URL" };
   }
 
   if (targetUrl.protocol !== "http:" && targetUrl.protocol !== "https:") {
@@ -191,6 +226,12 @@ function parseDownloadUrl(value, config) {
 
   if (config.https && targetUrl.protocol !== "https:") {
     return { error: "Only https URLs are allowed" };
+  }
+
+  for (const [name, value] of requestUrl.searchParams) {
+    if (!RESERVED_QUERY_PARAMS.has(name)) {
+      targetUrl.searchParams.append(name, value);
+    }
   }
 
   return { targetUrl };
@@ -205,11 +246,11 @@ function parseUpstreamHeaders(value) {
   try {
     parsedHeaders = JSON.parse(value);
   } catch {
-    return { error: "Invalid headers parameter" };
+    return { error: "Invalid _headers parameter" };
   }
 
   if (!parsedHeaders || Array.isArray(parsedHeaders) || typeof parsedHeaders !== "object") {
-    return { error: "Invalid headers parameter" };
+    return { error: "Invalid _headers parameter" };
   }
 
   const headers = {};
@@ -226,7 +267,7 @@ function parseUpstreamHeaders(value) {
     try {
       new Headers({ [name]: String(headerValue) });
     } catch {
-      return { error: "Invalid headers parameter" };
+      return { error: "Invalid _headers parameter" };
     }
 
     headers[name] = String(headerValue);
@@ -236,21 +277,22 @@ function parseUpstreamHeaders(value) {
 }
 
 function parseRequestOptions(url) {
-  const mode = (url.searchParams.get("mode") || "proxy").trim().toLowerCase();
-  const dispositionValue = url.searchParams.get("disposition");
+  const mode = (url.searchParams.get("_mode") || "page").trim().toLowerCase();
+  const dispositionValue = url.searchParams.get("_disposition");
   const disposition = dispositionValue ? dispositionValue.trim().toLowerCase() : null;
 
   if (!VALID_MODES.has(mode)) {
-    return { error: "Invalid mode parameter" };
+    return { error: "Invalid _mode parameter" };
   }
 
   if (disposition && !VALID_DISPOSITIONS.has(disposition)) {
-    return { error: "Invalid disposition parameter" };
+    return { error: "Invalid _disposition parameter" };
   }
 
   return {
     mode,
     disposition,
+    key: url.searchParams.get("_key") || "",
   };
 }
 
@@ -272,7 +314,22 @@ function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}) {
     headers.delete(name);
   }
 
-  // headers 查询参数用于临时补充源站需要的请求头，例如 Referer、User-Agent、Accept。
+  headers.delete("cf-connecting-ip");
+  headers.delete("cf-ipcountry");
+  headers.delete("cf-ray");
+  headers.delete("x-forwarded-for");
+  headers.delete("x-forwarded-proto");
+
+  headers.set("Host", targetUrl.host);
+
+  if (headers.has("Origin")) {
+    headers.set("Origin", targetUrl.origin);
+  }
+
+  if (headers.has("Referer")) {
+    headers.set("Referer", targetUrl.href);
+  }
+
   for (const [name, value] of Object.entries(extraHeaders)) {
     if (value === undefined || value === null) {
       continue;
@@ -282,13 +339,6 @@ function buildUpstreamHeaders(request, targetUrl, extraHeaders = {}) {
       headers.set(name, String(value));
     }
   }
-
-  headers.delete("cf-connecting-ip");
-  headers.delete("cf-ipcountry");
-  headers.delete("cf-ray");
-  headers.delete("x-forwarded-for");
-  headers.delete("x-forwarded-proto");
-  headers.set("Host", targetUrl.host);
 
   return headers;
 }
@@ -351,6 +401,15 @@ function isTextResponse(headers) {
   );
 }
 
+function isHtmlResponse(headers) {
+  return (headers.get("Content-Type") || "").toLowerCase().includes("text/html");
+}
+
+function isCssResponse(headers) {
+  const contentType = (headers.get("Content-Type") || "").toLowerCase();
+  return contentType.includes("text/css");
+}
+
 function hasReplaceRules(replaceDict) {
   return Object.keys(replaceDict).length > 0;
 }
@@ -365,15 +424,162 @@ function replaceText(text, replaceDict) {
   return replacedText;
 }
 
-async function buildProxyResponse(upstreamResponse, config) {
+function shouldSkipUrlRewrite(value) {
+  const trimmedValue = value.trim();
+
+  return (
+    !trimmedValue ||
+    trimmedValue.startsWith("#") ||
+    /^(?:mailto|tel|javascript|data|blob):/i.test(trimmedValue)
+  );
+}
+
+function escapeHtmlAttribute(value) {
+  return value.replaceAll("&", "&amp;").replaceAll('"', "&quot;");
+}
+
+function buildProxyUrl(targetUrl, requestUrl, config, requestOptions) {
+  const proxyUrl = new URL(requestUrl.origin);
+  const targetPath =
+    targetUrl.protocol === "https:"
+      ? `${targetUrl.host}${targetUrl.pathname}`
+      : `${targetUrl.protocol}//${targetUrl.host}${targetUrl.pathname}`;
+  proxyUrl.pathname = `${config.proxy_path}/${targetPath}`;
+  proxyUrl.search = targetUrl.search;
+
+  if (requestOptions.key) {
+    proxyUrl.searchParams.set("_key", requestOptions.key);
+  }
+
+  return `${proxyUrl.pathname}${proxyUrl.search}`;
+}
+
+function rewriteUrlValue(value, baseUrl, requestUrl, config, requestOptions, htmlAttribute = false) {
+  if (shouldSkipUrlRewrite(value)) {
+    return value;
+  }
+
+  let targetUrl;
+  try {
+    targetUrl = new URL(value, baseUrl.href);
+  } catch {
+    return value;
+  }
+
+  if (targetUrl.protocol !== "http:" && targetUrl.protocol !== "https:") {
+    return value;
+  }
+
+  const rewrittenUrl = buildProxyUrl(targetUrl, requestUrl, config, requestOptions);
+  return htmlAttribute ? escapeHtmlAttribute(rewrittenUrl) : rewrittenUrl;
+}
+
+function rewriteSrcset(value, baseUrl, requestUrl, config, requestOptions) {
+  return value
+    .split(",")
+    .map((candidate) => {
+      const trimmedCandidate = candidate.trim();
+      if (!trimmedCandidate) {
+        return candidate;
+      }
+
+      const parts = trimmedCandidate.split(/\s+/);
+      parts[0] = rewriteUrlValue(parts[0], baseUrl, requestUrl, config, requestOptions, true);
+      return parts.join(" ");
+    })
+    .join(", ");
+}
+
+function rewriteMetaRefresh(value, baseUrl, requestUrl, config, requestOptions) {
+  return value.replace(/(\burl\s*=\s*)([^;]+)/i, (match, prefix, urlValue) => {
+    const quote = /^['"]/.test(urlValue.trim()) ? urlValue.trim()[0] : "";
+    const unquotedUrl = quote ? urlValue.trim().slice(1, -1) : urlValue.trim();
+    const rewrittenUrl = rewriteUrlValue(unquotedUrl, baseUrl, requestUrl, config, requestOptions, false);
+    return `${prefix}${quote}${rewrittenUrl}${quote}`;
+  });
+}
+
+function rewriteHtml(html, baseUrl, requestUrl, config, requestOptions) {
+  let rewrittenHtml = html.replace(
+    /\b(href|src|action|poster|data)=("([^"]*)"|'([^']*)')/gi,
+    (match, name, quotedValue, doubleValue, singleValue) => {
+      const quote = quotedValue[0];
+      const value = doubleValue ?? singleValue ?? "";
+      const rewrittenValue = rewriteUrlValue(value, baseUrl, requestUrl, config, requestOptions, true);
+      return `${name}=${quote}${rewrittenValue}${quote}`;
+    },
+  );
+
+  rewrittenHtml = rewrittenHtml.replace(/\bsrcset=("([^"]*)"|'([^']*)')/gi, (match, quotedValue, doubleValue, singleValue) => {
+    const quote = quotedValue[0];
+    const value = doubleValue ?? singleValue ?? "";
+    const rewrittenValue = rewriteSrcset(value, baseUrl, requestUrl, config, requestOptions);
+    return `srcset=${quote}${rewrittenValue}${quote}`;
+  });
+
+  return rewrittenHtml.replace(
+    /(<meta\b[^>]*http-equiv=["']?refresh["']?[^>]*content=)(["'])(.*?)\2/gi,
+    (match, prefix, quote, value) => {
+      const rewrittenValue = rewriteMetaRefresh(value, baseUrl, requestUrl, config, requestOptions);
+      return `${prefix}${quote}${escapeHtmlAttribute(rewrittenValue)}${quote}`;
+    },
+  );
+}
+
+function rewriteCss(css, baseUrl, requestUrl, config, requestOptions) {
+  let rewrittenCss = css.replace(/url\(\s*(?:"([^"]*)"|'([^']*)'|([^'")]*))\s*\)/gi, (match, doubleValue, singleValue, bareValue) => {
+    const value = doubleValue ?? singleValue ?? bareValue ?? "";
+    if (shouldSkipUrlRewrite(value)) {
+      return match;
+    }
+
+    const quote = doubleValue !== undefined ? '"' : singleValue !== undefined ? "'" : '"';
+    const rewrittenValue = rewriteUrlValue(value.trim(), baseUrl, requestUrl, config, requestOptions, false);
+    return `url(${quote}${rewrittenValue}${quote})`;
+  });
+
+  rewrittenCss = rewrittenCss.replace(/@import\s+(?:"([^"]*)"|'([^']*)')/gi, (match, doubleValue, singleValue) => {
+    const quote = doubleValue !== undefined ? '"' : "'";
+    const value = doubleValue ?? singleValue ?? "";
+    const rewrittenValue = rewriteUrlValue(value, baseUrl, requestUrl, config, requestOptions, false);
+    return `@import ${quote}${rewrittenValue}${quote}`;
+  });
+
+  return rewrittenCss;
+}
+
+async function buildPageResponse(upstreamResponse, request, targetUrl, requestOptions, config) {
   const headers = buildResponseHeaders(upstreamResponse.headers, config);
+
+  if (isHtmlResponse(upstreamResponse.headers)) {
+    let html = await upstreamResponse.text();
+    html = rewriteHtml(html, targetUrl, new URL(request.url), config, requestOptions);
+    headers.delete("Content-Length");
+
+    return new Response(html, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers,
+    });
+  }
+
+  if (isCssResponse(upstreamResponse.headers)) {
+    let css = await upstreamResponse.text();
+    css = rewriteCss(css, targetUrl, new URL(request.url), config, requestOptions);
+    headers.delete("Content-Length");
+
+    return new Response(css, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers,
+    });
+  }
 
   if (hasReplaceRules(config.replace_dict) && isTextResponse(upstreamResponse.headers)) {
     const text = await upstreamResponse.text();
-    const replacedText = replaceText(text, config.replace_dict);
     headers.delete("Content-Length");
 
-    return new Response(replacedText, {
+    return new Response(replaceText(text, config.replace_dict), {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
       headers,
@@ -564,16 +770,12 @@ function resolveUpstreamCacheTtl(upstreamHeaders) {
   return clampCacheTtl(Math.floor((expiresAt - now) / 1000));
 }
 
-function resolveProxyCacheTtl(requestOptions, upstreamHeaders) {
-  return resolveUpstreamCacheTtl(upstreamHeaders);
-}
-
-function resolveRangeCacheTtl(requestOptions, upstreamHeaders) {
+function resolveRangeCacheTtl(upstreamHeaders) {
   return resolveUpstreamCacheTtl(upstreamHeaders) || DEFAULT_RANGE_CACHE_TTL;
 }
 
-function canUseManagedCache(config) {
-  return !config.disable_cache;
+function canUseManagedCache(config, request) {
+  return !config.disable_cache && request.method === "GET";
 }
 
 function requestRequiresCacheRefresh(request) {
@@ -604,94 +806,6 @@ async function cacheResponseBody(cache, cacheRequest, response, ttl, config) {
   );
 }
 
-async function handleProxy(request, targetUrl, extraHeaders, requestOptions, config) {
-  const requestUrl = new URL(request.url);
-  const cache = getDefaultCache();
-  const managedCacheEnabled = canUseManagedCache(config);
-  const shouldRefreshCache = requestRequiresCacheRefresh(request);
-  const rangeHeader = request.headers.get("Range");
-  const cacheRequest = managedCacheEnabled
-    ? await buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders)
-    : null;
-
-  if (managedCacheEnabled && !shouldRefreshCache && cache && cacheRequest) {
-    const cachedResponse = await cache.match(buildCacheLookupRequest(cacheRequest, request));
-
-    if (cachedResponse) {
-      return finalizeResponse(cachedResponse, request.method, requestOptions.disposition, {
-        "X-Proxy-Cache": "hit",
-      });
-    }
-  }
-
-  const upstreamResponse = await fetch(targetUrl.href, {
-    method: request.method,
-    headers: buildUpstreamHeaders(request, targetUrl, extraHeaders),
-    redirect: "follow",
-  });
-
-  const proxyResponse = await buildProxyResponse(upstreamResponse, config);
-
-  if (rangeHeader && upstreamResponse.status === 200 && proxyResponse.ok) {
-    const buffer = await proxyResponse.clone().arrayBuffer();
-    const resolvedTtl = resolveRangeCacheTtl(requestOptions, upstreamResponse.headers);
-
-    if (managedCacheEnabled && cache && cacheRequest && request.method === "GET") {
-      const headers = buildRangeResponseHeaders(upstreamResponse.headers, config, resolvedTtl);
-      headers.delete("Content-Range");
-      headers.set("Content-Length", String(buffer.byteLength));
-
-      await cache.put(
-        cacheRequest,
-        new Response(buffer.slice(0), {
-          status: 200,
-          headers,
-        }),
-      );
-    }
-
-    const response = buildBufferedRangeResponse(
-      buffer,
-      upstreamResponse.headers,
-      request,
-      config,
-      requestOptions.disposition,
-      resolvedTtl,
-    );
-
-    const cacheStatus = !managedCacheEnabled
-      ? "bypass"
-      : shouldRefreshCache
-        ? "refresh"
-        : "miss";
-
-    return finalizeResponse(response, request.method, requestOptions.disposition, {
-      "X-Proxy-Cache": cacheStatus,
-    });
-  }
-
-  if (!managedCacheEnabled || !proxyResponse.ok || request.method !== "GET" || !cache || !cacheRequest) {
-    return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
-      "X-Proxy-Cache": "bypass",
-    });
-  }
-
-  const resolvedTtl = resolveProxyCacheTtl(requestOptions, upstreamResponse.headers);
-  const cacheStatus = shouldRefreshCache ? "refresh" : "miss";
-
-  if (!resolvedTtl) {
-    return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
-      "X-Proxy-Cache": "store-skipped",
-    });
-  }
-
-  await cacheResponseBody(cache, cacheRequest, proxyResponse, resolvedTtl, config);
-
-  return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
-    "X-Proxy-Cache": cacheStatus,
-  });
-}
-
 function buildCacheLookupRequest(cacheRequest, originalRequest) {
   const headers = new Headers();
   const rangeHeader = originalRequest.headers.get("Range");
@@ -710,16 +824,137 @@ function getDefaultCache() {
   return globalThis.caches?.default || null;
 }
 
+async function handleRange(request, targetUrl, extraHeaders, requestOptions, config) {
+  const requestUrl = new URL(request.url);
+  const cache = getDefaultCache();
+  const managedCacheEnabled = canUseManagedCache(config, request);
+  const shouldRefreshCache = requestRequiresCacheRefresh(request);
+  const cacheRequest = managedCacheEnabled
+    ? await buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders)
+    : null;
+
+  if (managedCacheEnabled && !shouldRefreshCache && cache && cacheRequest) {
+    const cachedResponse = await cache.match(buildCacheLookupRequest(cacheRequest, request));
+
+    if (cachedResponse) {
+      return finalizeResponse(cachedResponse, request.method, requestOptions.disposition, {
+        "X-Proxy-Cache": "hit",
+      });
+    }
+  }
+
+  const upstreamHeaders = buildUpstreamHeaders(request, targetUrl, extraHeaders);
+  const upstreamResponse = await fetch(targetUrl.href, {
+    method: "GET",
+    headers: upstreamHeaders,
+    redirect: "follow",
+  });
+
+  if (upstreamResponse.status === 206) {
+    return finalizeResponse(
+      new Response(upstreamResponse.body, {
+        status: upstreamResponse.status,
+        statusText: upstreamResponse.statusText,
+        headers: buildResponseHeaders(upstreamResponse.headers, config),
+      }),
+      request.method,
+      requestOptions.disposition,
+      { "X-Proxy-Cache": "bypass" },
+    );
+  }
+
+  const buffer = await upstreamResponse.arrayBuffer();
+  const resolvedTtl = resolveRangeCacheTtl(upstreamResponse.headers);
+
+  if (managedCacheEnabled && cache && cacheRequest && upstreamResponse.ok) {
+    const headers = buildRangeResponseHeaders(upstreamResponse.headers, config, resolvedTtl);
+    headers.delete("Content-Range");
+    headers.set("Content-Length", String(buffer.byteLength));
+
+    await cache.put(
+      cacheRequest,
+      new Response(buffer.slice(0), {
+        status: 200,
+        headers,
+      }),
+    );
+  }
+
+  const response = buildBufferedRangeResponse(
+    buffer,
+    upstreamResponse.headers,
+    request,
+    config,
+    requestOptions.disposition,
+    resolvedTtl,
+  );
+
+  return finalizeResponse(response, request.method, requestOptions.disposition, {
+    "X-Proxy-Cache": managedCacheEnabled ? "miss" : "bypass",
+  });
+}
+
+async function handleProxy(request, targetUrl, extraHeaders, requestOptions, config) {
+  const requestUrl = new URL(request.url);
+  const cache = getDefaultCache();
+  const managedCacheEnabled = requestOptions.mode === "proxy" && canUseManagedCache(config, request);
+  const shouldRefreshCache = requestRequiresCacheRefresh(request);
+  const cacheRequest = managedCacheEnabled
+    ? await buildProxyCacheRequest(requestUrl, targetUrl, extraHeaders)
+    : null;
+
+  if (managedCacheEnabled && !shouldRefreshCache && cache && cacheRequest) {
+    const cachedResponse = await cache.match(cacheRequest);
+
+    if (cachedResponse) {
+      return finalizeResponse(cachedResponse, request.method, requestOptions.disposition, {
+        "X-Proxy-Cache": "hit",
+      });
+    }
+  }
+
+  const fetchInit = {
+    method: request.method,
+    headers: buildUpstreamHeaders(request, targetUrl, extraHeaders),
+    redirect: "follow",
+  };
+
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    fetchInit.body = request.body;
+  }
+
+  const upstreamResponse = await fetch(targetUrl.href, fetchInit);
+  const proxyResponse = await buildPageResponse(upstreamResponse, request, targetUrl, requestOptions, config);
+
+  if (!managedCacheEnabled || !proxyResponse.ok || !cache || !cacheRequest) {
+    return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
+      "X-Proxy-Cache": managedCacheEnabled ? "store-skipped" : "bypass",
+    });
+  }
+
+  const resolvedTtl = resolveUpstreamCacheTtl(upstreamResponse.headers);
+  if (!resolvedTtl) {
+    return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
+      "X-Proxy-Cache": "store-skipped",
+    });
+  }
+
+  await cacheResponseBody(cache, cacheRequest, proxyResponse, resolvedTtl, config);
+
+  return finalizeResponse(proxyResponse, request.method, requestOptions.disposition, {
+    "X-Proxy-Cache": shouldRefreshCache ? "refresh" : "miss",
+  });
+}
+
 async function fetchUpstreamMetadata(request, targetUrl, extraHeaders) {
   const headers = buildUpstreamHeaders(request, targetUrl, extraHeaders);
   headers.delete("Range");
-  const headResponse = await fetch(targetUrl.href, {
+
+  return fetch(targetUrl.href, {
     method: "HEAD",
     headers,
     redirect: "follow",
   });
-
-  return headResponse;
 }
 
 async function handleInspect(request, targetUrl, extraHeaders, requestOptions, config) {
@@ -750,7 +985,7 @@ async function handleInspect(request, targetUrl, extraHeaders, requestOptions, c
   });
 }
 
-async function handleDownload(request, env, config) {
+async function handleProxyEntry(request, env, config) {
   if (request.method === "OPTIONS") {
     return new Response(null, {
       status: 204,
@@ -758,7 +993,7 @@ async function handleDownload(request, env, config) {
     });
   }
 
-  if (request.method !== "GET" && request.method !== "HEAD") {
+  if (!ALLOWED_METHODS.includes(request.method)) {
     return textResponse("Method Not Allowed", 405, {
       Allow: ALLOWED_METHODS.join(", "),
     });
@@ -775,12 +1010,12 @@ async function handleDownload(request, env, config) {
     return textResponse("Unauthorized", 401);
   }
 
-  const { targetUrl, error } = parseDownloadUrl(requestUrl.searchParams.get("url"), config);
+  const { targetUrl, error } = parseTargetUrl(requestUrl, config);
   if (error) {
     return textResponse(error, 400);
   }
 
-  const { headers: extraHeaders, error: headersError } = parseUpstreamHeaders(requestUrl.searchParams.get("headers"));
+  const { headers: extraHeaders, error: headersError } = parseUpstreamHeaders(requestUrl.searchParams.get("_headers"));
   if (headersError) {
     return textResponse(headersError, 400);
   }
@@ -788,6 +1023,7 @@ async function handleDownload(request, env, config) {
   const {
     mode,
     disposition,
+    key,
     error: optionsError,
   } = parseRequestOptions(requestUrl);
   if (optionsError) {
@@ -797,10 +1033,15 @@ async function handleDownload(request, env, config) {
   const requestOptions = {
     mode,
     disposition,
+    key,
   };
 
   if (requestOptions.mode === "inspect") {
     return handleInspect(request, targetUrl, extraHeaders, requestOptions, config);
+  }
+
+  if (requestOptions.mode === "range") {
+    return handleRange(request, targetUrl, extraHeaders, requestOptions, config);
   }
 
   return handleProxy(request, targetUrl, extraHeaders, requestOptions, config);
@@ -813,12 +1054,12 @@ export function createWorker(config = {}) {
     async fetch(request, env = {}) {
       const url = new URL(request.url);
 
-      if (url.pathname !== normalizedConfig.download_path) {
+      if (!matchesProxyPath(url.pathname, normalizedConfig.proxy_path)) {
         return handleFallback(normalizedConfig);
       }
 
       try {
-        return await handleDownload(request, env, normalizedConfig);
+        return await handleProxyEntry(request, env, normalizedConfig);
       } catch (error) {
         console.error("[worker] unhandled.fetch.error", {
           url: request.url,
