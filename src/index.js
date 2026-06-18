@@ -276,6 +276,48 @@ function parseTargetUrl(requestUrl, config) {
   return { targetUrl };
 }
 
+function buildRefererRecoveredRequest(request, config) {
+  const requestUrl = new URL(request.url);
+  const refererValue = request.headers.get("Referer");
+
+  if (!refererValue) {
+    return null;
+  }
+
+  let refererUrl;
+  try {
+    refererUrl = new URL(refererValue);
+  } catch {
+    return null;
+  }
+
+  if (refererUrl.origin !== requestUrl.origin || !matchesProxyPath(refererUrl.pathname, config.proxy_path)) {
+    return null;
+  }
+
+  const { targetUrl, error } = parseTargetUrl(refererUrl, config);
+  if (error) {
+    return null;
+  }
+
+  const recoveredTargetUrl = new URL(`${requestUrl.pathname}${requestUrl.search}`, targetUrl.origin);
+  const recoveredUrl = new URL(requestUrl.origin);
+  const targetPath =
+    recoveredTargetUrl.protocol === "https:"
+      ? `${recoveredTargetUrl.host}${recoveredTargetUrl.pathname}`
+      : `${recoveredTargetUrl.protocol}//${recoveredTargetUrl.host}${recoveredTargetUrl.pathname}`;
+
+  recoveredUrl.pathname = `${config.proxy_path}/${targetPath}`;
+  recoveredUrl.search = recoveredTargetUrl.search;
+
+  const refererKey = refererUrl.searchParams.get("_key");
+  if (refererKey && !recoveredUrl.searchParams.has("_key")) {
+    recoveredUrl.searchParams.set("_key", refererKey);
+  }
+
+  return new Request(recoveredUrl.href, request);
+}
+
 function parseUpstreamHeaders(value) {
   if (!value) {
     return { headers: {} };
@@ -1275,17 +1317,22 @@ export function createWorker(config = {}) {
   return {
     async fetch(request, env = {}) {
       const url = new URL(request.url);
+      let proxyRequest = request;
 
       if (!matchesProxyPath(url.pathname, normalizedConfig.proxy_path)) {
-        return handleFallback(normalizedConfig);
+        proxyRequest = buildRefererRecoveredRequest(request, normalizedConfig);
+
+        if (!proxyRequest) {
+          return handleFallback(normalizedConfig);
+        }
       }
 
       try {
-        return await handleProxyEntry(request, env, normalizedConfig);
+        return await handleProxyEntry(proxyRequest, env, normalizedConfig);
       } catch (error) {
         console.error("[worker] unhandled.fetch.error", {
-          url: request.url,
-          method: request.method,
+          url: proxyRequest.url,
+          method: proxyRequest.method,
           message: error instanceof Error ? error.message : String(error),
           stack: error instanceof Error ? error.stack : undefined,
         });

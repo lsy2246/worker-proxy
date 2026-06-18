@@ -581,6 +581,52 @@ test("serves configured fallback HTML for non-proxy paths", async () => {
   assert.equal(await response.text(), "<!doctype html><title>Home</title><main>hello</main>");
 });
 
+test("recovers same-origin navigations from proxied page referers", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    assert.equal(url, "https://github.com/search?q=lsy22&type=repositories");
+    return new Response("<!doctype html><title>Search</title>", {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+  };
+
+  try {
+    const response = await worker.fetch(
+      request("/search?q=lsy22&type=repositories", {
+        headers: {
+          Referer: "https://proxy.example.test/api/file/github.com?_key=secret",
+        },
+      }),
+      env,
+      {},
+    );
+    const html = await response.text();
+
+    assert.equal(response.status, 200);
+    assert.match(html, /<title>Search<\/title>/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("keeps fallback for non-proxy paths without proxied referers", async () => {
+  const configuredWorker = createWorker({
+    fallback_mode: "html",
+    fallback_html: "<!doctype html><title>Fallback</title>",
+  });
+
+  const response = await configuredWorker.fetch(
+    request("/search?q=lsy22"),
+    env,
+    {},
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(await response.text(), "<!doctype html><title>Fallback</title>");
+});
+
 test("uses a configured proxy path before applying fallback behavior", async () => {
   const configuredWorker = createWorker({
     proxy_path: "/service/view",
