@@ -1031,7 +1031,8 @@ function buildRuntimeScript(baseUrl, config, requestOptions) {
 
     try {
       const target = new URL(value, location.href);
-      if (alreadyProxied(target) || !containsProxyPathHint(target)) {
+      const isProxyRoot = target.origin === proxyOrigin && target.pathname === "/" && !target.search && !target.hash;
+      if (alreadyProxied(target) || (!isProxyRoot && !containsProxyPathHint(target))) {
         return value;
       }
 

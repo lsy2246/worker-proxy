@@ -1047,6 +1047,61 @@ test("runtime keeps proxy paths for history navigations with embedded proxy retu
   }
 });
 
+test("runtime keeps proxy root paths for history navigations to target root", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("<!doctype html><title>App</title>", {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/x.com/i/jf/onboarding/web?_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+    const scriptMatch = /<script data-worker-proxy-runtime>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(scriptMatch);
+
+    const pushedUrls = [];
+    const replacedUrls = [];
+    const sandbox = {
+      URL,
+      Request,
+      location: new URL("https://proxy.example.test/api/file/x.com/i/jf/onboarding/web?_key=secret"),
+      window: {},
+      XMLHttpRequest: function XMLHttpRequest() {},
+      navigator: {},
+      HTMLFormElement: function HTMLFormElement() {},
+      history: {
+        pushState(state, title, url) {
+          pushedUrls.push(url);
+        },
+        replaceState(state, title, url) {
+          replacedUrls.push(url);
+        },
+      },
+      document: {
+        addEventListener() {},
+      },
+    };
+    sandbox.XMLHttpRequest.prototype.open = function open() {};
+    sandbox.HTMLFormElement.prototype.submit = function submit() {};
+
+    vm.runInNewContext(scriptMatch[1], sandbox);
+    sandbox.history.pushState({}, "", "/");
+    sandbox.history.replaceState({}, "", "https://proxy.example.test/");
+
+    assert.equal(pushedUrls[0], "https://proxy.example.test/api/file/x.com/?_key=secret");
+    assert.equal(replacedUrls[0], "https://proxy.example.test/api/file/x.com/?_key=secret");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("preserves explicit http targets when rewriting links", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
