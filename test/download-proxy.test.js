@@ -745,8 +745,8 @@ test("injects a runtime URL patch for dynamic browser requests", async () => {
     assert.match(html, /alreadyProxied/);
     assert.match(html, /document\.addEventListener\("submit"/);
     assert.match(html, /HTMLFormElement\.prototype\.submit/);
-    assert.doesNotMatch(html, /history\.pushState = function/);
-    assert.doesNotMatch(html, /history\.replaceState = function/);
+    assert.match(html, /history\.pushState = function/);
+    assert.match(html, /history\.replaceState = function/);
     assert.doesNotMatch(html, /searchParams\.set\("_target"/);
     assert.match(html, /searchParams\.set\("_key", proxyKey\)/);
   } finally {
@@ -973,6 +973,75 @@ test("runtime leaves SPA history route updates visible to the app router", async
     sandbox.history.pushState({}, "", "/search?q=lsy22&type=repositories");
 
     assert.deepEqual(pushedUrls, ["/search?q=lsy22&type=repositories"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("runtime keeps proxy paths for history navigations with embedded proxy return paths", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response("<!doctype html><title>App</title>", {
+      headers: {
+        "Content-Type": "text/html; charset=utf-8",
+      },
+    });
+
+  try {
+    const response = await worker.fetch(
+      request("/api/file/x.com?_key=secret"),
+      env,
+      {},
+    );
+    const html = await response.text();
+    const scriptMatch = /<script data-worker-proxy-runtime>([\s\S]*?)<\/script>/.exec(html);
+    assert.ok(scriptMatch);
+
+    const pushedUrls = [];
+    const replacedUrls = [];
+    const sandbox = {
+      URL,
+      Request,
+      location: new URL("https://proxy.example.test/api/file/x.com?_key=secret"),
+      window: {},
+      XMLHttpRequest: function XMLHttpRequest() {},
+      navigator: {},
+      HTMLFormElement: function HTMLFormElement() {},
+      history: {
+        pushState(state, title, url) {
+          pushedUrls.push(url);
+        },
+        replaceState(state, title, url) {
+          replacedUrls.push(url);
+        },
+      },
+      document: {
+        addEventListener() {},
+      },
+    };
+    sandbox.XMLHttpRequest.prototype.open = function open() {};
+    sandbox.HTMLFormElement.prototype.submit = function submit() {};
+
+    vm.runInNewContext(scriptMatch[1], sandbox);
+    sandbox.history.pushState(
+      {},
+      "",
+      "/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login",
+    );
+    sandbox.history.replaceState(
+      {},
+      "",
+      "https://proxy.example.test/i/jf/onboarding/web?redirect_after_login=https%3A%2F%2Fproxy.example.test%2Fapi%2Ffile%2Fx.com&mode=login",
+    );
+
+    assert.equal(
+      pushedUrls[0],
+      "https://proxy.example.test/api/file/x.com/i/jf/onboarding/web?redirect_after_login=%2Fapi%2Ffile%2Fx.com&mode=login&_key=secret",
+    );
+    assert.equal(
+      replacedUrls[0],
+      "https://proxy.example.test/api/file/x.com/i/jf/onboarding/web?redirect_after_login=https%3A%2F%2Fproxy.example.test%2Fapi%2Ffile%2Fx.com&mode=login&_key=secret",
+    );
   } finally {
     globalThis.fetch = originalFetch;
   }
